@@ -27,6 +27,24 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi);
 // MEM_WRITE_WATCH), their addresses into pages[] (at most max), and the tracking reset for the range. Returns the
 // count (max: maybe more), or -1 where there is no tracking (macOS, Linux). Page size: *page.
 int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page);
+// CPU data cache maintenance for memory a GPU reads or writes without snooping the CPU's caches (aarch64 Linux, where
+// EL0 may use DC CVAC / DC CIVAC; elsewhere nothing). Clean: what the CPU wrote reaches memory. Clean + invalidate:
+// also drops the lines, so the CPU's next read comes from memory (after the GPU wrote it). (From LAS Recomp #546.)
+static inline void plat_cache_op(uint64_t addr, uint64_t size, bool invalidate) {
+#if defined(__aarch64__) && defined(__linux__)
+    static uint64_t line;
+    if (!size) return;
+    if (!line) { uint64_t ctr; __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr)); line = 4ull << ((ctr >> 16) & 0xF); }
+    if (invalidate) __asm__ volatile("dsb sy" ::: "memory");
+    for (uint64_t a = addr & ~(line - 1); a < addr + size; a += line) {
+        if (invalidate) __asm__ volatile("dc civac, %0" ::"r"(a) : "memory");
+        else __asm__ volatile("dc cvac, %0" ::"r"(a) : "memory");
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+#else
+    (void)addr; (void)size; (void)invalidate;
+#endif
+}
 enum { PLAT_PROT_NONE = 0, PLAT_PROT_READ = 1, PLAT_PROT_RW = 3 };
 int plat_protect(uint64_t addr, uint64_t size, int prot);  // 0 on success
 #define PLAT_PAGE 0x4000ull  // largest page size we deal with (macOS 16K; multiple of Windows' 4K)
