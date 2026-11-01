@@ -87,6 +87,14 @@ typedef struct {
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
     int stack_push[3];       // GLSL: SSY / PBK / PCNT push sites (sizes the branch stacks: glsl_stacks)
+    // EOWRECOMP_KIL_DEBUG=<instruction word hex>:<ra>,<rb>: in a fragment shader containing that word, each KIL
+    // instead writes c0 = (ra, rb, first KIL ? 1 : 0, 1) and returns (debug: which discard fires, and why).
+    int kil_dbg_ra, kil_dbg_rb;  // -1: off
+    int kil_count;
+    // EOWRECOMP_PC_DEBUG=<instruction word hex>:<pc hex>:<ra>,<rb>,<rc>: in that fragment shader, right after the
+    // instruction at pc, c0 = (float ra, float rb, uint rc / 255, 1) and return (rc: e.g. a stencil value)
+    int pc_dbg_r[3];
+    uint32_t pc_dbg_pc;  // 0: off
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -174,6 +182,15 @@ static const char *operand_c_for_ffma(Ctx *c, uint64_t w, char *buf, const char 
     }
     *b_out = operand_b(c, w, true, bbuf);
     return reg(c, (int)bits(w, 39, 8), buf);
+}
+
+// Warp ops (VOTE, SHFL, lane ids) act on this lane alone: always in vertex functions; in fragment functions too with
+// EOWRECOMP_FS_LANE_LOCAL=1 (test: the emulated pc loop can split a warp, so a ballot sees a partial warp and
+// shuffles read lanes that are elsewhere - suspected cause of the blocky lighting grid in Suthorn Ruins).
+static bool lane_local(Ctx *c) {
+    static int fs = -1;
+    if (fs < 0) { const char *e = getenv("EOWRECOMP_FS_LANE_LOCAL"); fs = e && *e == '1'; }
+    return c->stage == STAGE_VERTEX || (fs && c->stage == STAGE_FRAGMENT);
 }
 
 static void set_reg(Ctx *c, int r, const char *expr) {
@@ -511,10 +528,19 @@ static const char *tex_type_name(int t) {
     }
 }
 
+// (GLSL fragment) texture slot s samples the stencil of a depth-stencil texture (ShaderKey.stencil_tex, by bound
+// handle slot): declared usampler2D; results keep the integer bits in the registers, as the hardware returns them.
+static bool tex_is_stencil(Ctx *c, int s) {
+    if (!c->glsl || !c->key || c->stage != STAGE_FRAGMENT || s < 0 || s >= c->info->ntex) return false;
+    const ShaderTexture *t = &c->info->tex[s];
+    int hs = ((int)t->handle_offset - 0x20) / 8;
+    return hs >= 0 && hs < 32 && ((c->key->stencil_tex >> hs) & 1) && !t->shadow && t->type == TEXTYPE_2D;
+}
+
 // Write texture results: component mask selects which of r,g,b,a go to consecutive registers.
 static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, int d0, int d1, bool texs, bool f16) {
-    sp(&c->body, "    { float4 t = %s;\n", call);
-    (void)slot;
+    if (tex_is_stencil(c, slot)) sp(&c->body, "    { float4 t = uintBitsToFloat(%s);\n", call);
+    else sp(&c->body, "    { float4 t = %s;\n", call);
     if (f16) {
         // TEXS/TLDS .F16: components (in mask order) packed as half pairs into d0 (lo, hi) and d1 (lo, hi)
         int comps[4], n = 0;
@@ -771,6 +797,37 @@ static void emit_texs(Ctx *c, uint64_t w, bool fetch) {
     write_tex_result(c, slot, call, mask, d0, d1, true, !bits(w, 59, 1));  // 0xd0/0xd2: .F16 results
 }
 
+// SUST.P (formatted surface store), GLSL compute only. Fields per Mesa's gm107 emitter: data gpr 0, coords gpr 8,
+// rgba mask 20, target 32 (4 bits: 6 = 2D), bit 51 = bound (tid at 36) else bindless (handle gpr 39).
+// NVN keeps the bound image handles in the driver cbuf 2 at 0x120 + 8 * slot (textures at 0x20 + 8 * slot); the
+// game's shaders load them from there and pass the value as a bindless handle. Images are declared per slot (img<i>,
+// binding SHADER_IMAGE_BINDING + i) and a bindless store picks the slot whose cbuf handle matches at run time.
+static void emit_sust(Ctx *c, uint64_t w) {
+    int dr = (int)bits(w, 0, 8), cr = (int)bits(w, 8, 8), mask = (int)bits(w, 20, 4), target = (int)bits(w, 32, 4);
+    if (!c->glsl || c->stage != STAGE_COMPUTE) { fail(c, "sust outside glsl compute"); return; }
+    if (bits(w, 52, 1)) { fail(c, "sust.b"); return; }
+    if (target != 6) { fail(c, "sust target %d", target); return; }
+    if (mask != 0xf) { fail(c, "sust mask %x", mask); return; }
+    if (dr == RZ || dr + 3 >= RZ || cr == RZ || cr + 1 >= RZ) { fail(c, "sust registers"); return; }
+    c->info->uses_images = true;
+    char co[64], data[128];
+    snprintf(co, sizeof co, "ivec2(int(%s), int(%s))", R(cr), R(cr + 1));
+    snprintf(data, sizeof data, "vec4(as_f(%s), as_f(%s), as_f(%s), as_f(%s))", R(dr), R(dr + 1), R(dr + 2), R(dr + 3));
+    if (bits(w, 51, 1)) {
+        int64_t off = (int64_t)bits(w, 36, 13) * 4 - 0x120;
+        if (off < 0 || off % 8 || off / 8 >= SHADER_MAX_IMAGES) { fail(c, "sust tid %#x", (unsigned)bits(w, 36, 13)); return; }
+        sp(&c->body, "    imageStore(img%d, %s, %s);\n", (int)(off / 8), co, data);
+        return;
+    }
+    sp(&c->body, "    { uint ih = %s;\n", R((int)bits(w, 39, 8)));
+    for (int i = 0; i < SHADER_MAX_IMAGES; i++) {
+        char cb[64];
+        cbuf_ref(c, 2, 0x120 + 8 * i, NULL, cb);
+        sp(&c->body, "      %sif (ih == %s) imageStore(img%d, %s, %s);\n", i ? "else " : "", cb, i, co, data);
+    }
+    sp(&c->body, "    }\n");
+}
+
 // TEX (full form): coordinates from consecutive registers at gpr8, extra parameters at gpr20.
 static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
@@ -867,6 +924,12 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xe330000000000000ull, 0xfff0000000000000ull)) {  // KIL
         c->info->uses_discard = true;
         if (getenv("EOWRECOMP_NO_DISCARD")) {
+        } else if (c->glsl && c->stage == STAGE_FRAGMENT && c->kil_dbg_ra >= 0) {
+            c->reg_used[c->kil_dbg_ra] = c->reg_used[c->kil_dbg_rb] = 1;
+            sp(&c->body, "    { c0 = vec4(as_f(r%d), as_f(r%d), %s, 1.0f);%s return; }\n", c->kil_dbg_ra,
+               c->kil_dbg_rb, c->kil_count == 0 ? "1.0f" : "0.0f",
+               c->omap_depth ? " gl_FragDepth = gl_FragCoord.z;" : "");
+            c->kil_count++;
         } else if (!c->glsl) sp(&c->body, "    discard_fragment();\n");
         else if (c->stage == STAGE_FRAGMENT) sp(&c->body, "    discard;\n");
         else sp(&c->body, "    /* kil */\n");  // GLSL has discard in fragment shaders only
@@ -929,13 +992,17 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int n = sz == 5 ? 2 : 1;
         char rb[16];
         const char *dyn = a == RZ ? NULL : reg(c, a, rb);
+        // LDC.64 with the address register equal to the first destination (LDC.64 R6, c[6][R6+0x28]): writing R6
+        // first would change the address of the second word. Latch the address before either write.
+        bool latch = dyn && n == 2;
+        if (latch) { sp(&c->body, "    { uint ldc_addr = %s;\n", dyn); dyn = "ldc_addr"; }
         for (int i = 0; i < n; i++) {
             char cb[256];
             cbuf_ref(c, idx, off + 4 * i, dyn, cb);
-            if (!dyn && (off + 4 * i) & 0) {}
             if (dyn) c->info->cbuf_size[idx] = 0x10000;
             set_reg(c, d + i, cb);
         }
+        if (latch) sp(&c->body, "    }\n");
     } else if (OPM(0xd000000000000000ull, 0xf600000000000000ull)) {  // TEXS
         emit_texs(c, w, false);
     } else if (OPM(0xd200000000000000ull, 0xf600000000000000ull)) {  // TLDS
@@ -1353,7 +1420,20 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         case 0x25: set_reg(c, d, "ctaid.x"); break;
         case 0x26: set_reg(c, d, "ctaid.y"); break;
         case 0x27: set_reg(c, d, "ctaid.z"); break;
-        case 0x00: set_reg(c, d, "0u"); break;
+        // SR_LANEID and SR_LANEMASK_EQ/LT/LE/GT/GE (0x38..0x3c). These were 0: the light-mask OR reduction of
+        // partly filled warps (ballot & LANEMASK_LT, then SHFL from the lane below) shuffled from lane 0 and lost
+        // lights in blocks along triangle edges (the screen-space "grid" in Suthorn Ruins). Vertex functions have
+        // no subgroup ops here, so there each lane stays lane 0 of a 1-lane group.
+        case 0x00: case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c:
+            if (lane_local(c)) {
+                set_reg(c, d, sr == 0x00 ? "0u" : sr == 0x38 || sr == 0x3a || sr == 0x3c ? "1u" : "0u");
+                break;
+            }
+            c->uses_lane = true;
+            set_reg(c, d, sr == 0x00 ? "lane" : sr == 0x38 ? "(1u << lane)" : sr == 0x39 ? "((1u << lane) - 1u)"
+                          : sr == 0x3a ? "((2u << lane) - 1u)" : sr == 0x3b ? "(~((2u << lane) - 1u))"
+                          : "(~((1u << lane) - 1u))");
+            break;
         default: sprintf(t, "0u /* sr %#x */", sr); set_reg(c, d, t);
         }
     } else if (OPM(0x5c30000000000000ull, 0xfff8000000000000ull) || OPM(0x4c30000000000000ull, 0xfff8000000000000ull) ||
@@ -1582,7 +1662,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         char bb[32];
         const char *bv = bits(w, 28, 1) ? (sprintf(bb, "%uu", (unsigned)bits(w, 20, 5)), bb) : R((int)bits(w, 20, 8));
         int pd = (int)bits(w, 48, 3);
-        if (c->stage == STAGE_VERTEX) {
+        if (lane_local(c)) {
             set_reg(c, d, R(a));  // no SIMD-group functions in vertex functions: lane-local value
         } else if (c->glsl) {  // a quad xor (lane mask < 4) is the subgroup xor within the quad
             static const char *const fn[] = {"subgroupShuffle", "subgroupShuffleUp", "subgroupShuffleDown", "subgroupShuffleXor"};
@@ -1614,7 +1694,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (mode > 2) fail(c, "vote mode %d", mode);
         static const char *const gl[] = {"subgroupAll(vp_)", "subgroupAny(vp_)", "subgroupAllEqual(vp_)"};
         static const char *const ms[] = {"simd_all(vp_)", "simd_any(vp_)", "(simd_all(vp_) || !simd_any(vp_))"};
-        bool lane = c->stage == STAGE_VERTEX;  // (no subgroup operations in vertex functions: this lane's own vote)
+        bool lane = lane_local(c);  // (no subgroup operations in vertex functions: this lane's own vote)
         sp(&c->body, "    { bool vp_ = %s;\n", P((int)bits(w, 39, 3), bits(w, 42, 1)));
         if (d != RZ) {
             c->reg_used[d] = 1;
@@ -1734,6 +1814,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (!c->glsl) sp(&c->body, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
         else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
         else sp(&c->body, "    /* bar */\n");  // GLSL barrier() is compute / tessellation only
+    } else if (OPM(0xeb20000000000000ull, 0xfff0000000000000ull) && getenv("EOWRECOMP_SUST_NOP")) {
+        // (debug) SUST as a comment, so the rest of the shader can be read (EOWRECOMP_SAVE_MSL). Fields per Mesa's
+        // gm107 emitter: data gpr 0, coords gpr 8, rgba mask 20, target 32 (4 bits), handle gpr 39 or tid 36 (bit 51)
+        sp(&c->body, "    /* SUST%s target %d mask %x data r%d coords r%d handle %s%d */\n", bits(w, 52, 1) ? ".B" : ".P",
+           (int)bits(w, 32, 4), (int)bits(w, 20, 4), (int)bits(w, 0, 8), (int)bits(w, 8, 8),
+           bits(w, 51, 1) ? "tid " : "r", bits(w, 51, 1) ? (int)bits(w, 36, 13) : (int)bits(w, 39, 8));
+    } else if (OPM(0xeb20000000000000ull, 0xfff0000000000000ull)) {  // SUST
+        emit_sust(c, w);
     } else {
         fail(c, "unknown instruction %016llx at %#x", (unsigned long long)w, pc);
     }
@@ -2045,7 +2133,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
-        sp(&s, "layout(set = %d, binding = %d) uniform %s t%d;\n", set, 32 + i, glsl_sampler_type(t), i);
+        sp(&s, "layout(set = %d, binding = %d) uniform %s%s t%d;\n", set, 32 + i, tex_is_stencil(c, i) ? "u" : "",
+           glsl_sampler_type(t), i);
         // size of level l as (width, height, depth or layers)
         switch (t->type) {
         case TEXTYPE_1D: sp(&s, "ivec3 tsize%d(int l) { return ivec3(textureSize(t%d, l), 1, 1); }\n", i, i); break;
@@ -2055,6 +2144,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         default: sp(&s, "ivec3 tsize%d(int l) { return ivec3(textureSize(t%d, l), 1); }\n", i, i);
         }
     }
+    if (info->uses_images)  // (SUST) one storage image per bound image slot; format-less (shaderStorageImageWriteWithoutFormat)
+        for (int i = 0; i < SHADER_MAX_IMAGES; i++)
+            sp(&s, "layout(set = %d, binding = %d) uniform writeonly image2D img%d;\n", set, SHADER_IMAGE_BINDING + i, i);
     if (stage == STAGE_VERTEX) {
         for (int i = 0; i < 32; i++) {
             if (!(c->in_attr_mask & (1u << i))) continue;
@@ -2183,6 +2275,25 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (w == 0 && i > 4) break;
         end = i + 1;
     }
+    c->kil_dbg_ra = c->kil_dbg_rb = -1;
+    const char *kd = stage == STAGE_FRAGMENT ? getenv("EOWRECOMP_KIL_DEBUG") : NULL;
+    if (kd) {
+        unsigned long long word = 0; int ra = 0, rb = 0;
+        if (sscanf(kd, "%llx:%d,%d", &word, &ra, &rb) == 3 && ra >= 0 && ra < 255 && rb >= 0 && rb < 255)
+            for (size_t i = 0; i < end; i++)
+                if (((const uint64_t *)code)[i] == (uint64_t)word) { c->kil_dbg_ra = ra; c->kil_dbg_rb = rb; break; }
+    }
+    const char *pd = stage == STAGE_FRAGMENT ? getenv("EOWRECOMP_PC_DEBUG") : NULL;
+    if (pd) {
+        unsigned long long word = 0; unsigned dpc = 0; int r[3];
+        if (sscanf(pd, "%llx:%x:%d,%d,%d", &word, &dpc, &r[0], &r[1], &r[2]) == 5 && dpc)
+            for (size_t i = 0; i < end; i++)
+                if (((const uint64_t *)code)[i] == (uint64_t)word) {
+                    c->pc_dbg_pc = dpc;
+                    for (int k = 0; k < 3; k++) c->pc_dbg_r[k] = r[k] >= 0 && r[k] < 255 ? r[k] : 255;
+                    break;
+                }
+    }
     // collect branch targets (labels)
     uint8_t *label = calloc(end + 4, 1);
     label[1] = 1;
@@ -2289,6 +2400,19 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         }
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
         emit_insn(c, ((const uint64_t *)code)[i], pc);
+        if (c->glsl && c->pc_dbg_pc && pc == c->pc_dbg_pc) {
+            char v[3][48];
+            for (int k = 0; k < 3; k++) {
+                int r = c->pc_dbg_r[k];
+                if (r < 250) c->reg_used[r] = 1;
+                if (r == 255) snprintf(v[k], sizeof v[k], "0.0f");
+                else if (r >= 250) snprintf(v[k], sizeof v[k], "float(texture(t%d, vec2(0.5f)).x)", r - 250);  // (t0..t3 at the centre)
+                else if (k < 2) snprintf(v[k], sizeof v[k], "as_f(r%d)", r);
+                else snprintf(v[k], sizeof v[k], "float(r%d) / 255.0f", r);
+            }
+            sp(&c->body, "    { c0 = vec4(%s, %s, %s, 1.0f);%s return; }\n", v[0], v[1], v[2],
+               c->omap_depth ? " gl_FragDepth = gl_FragCoord.z;" : "");
+        }
         if (dbg && pc == maxwell_dbg_pc) {
             int rr = maxwell_dbg_reg % 1000, half = maxwell_dbg_reg / 1000;  // +1000: low f16, +2000: high f16
             c->reg_used[rr] = 1;

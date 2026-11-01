@@ -45,6 +45,7 @@ typedef struct {
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
+    uint32_t stencil_tex;   // (GLSL fragment) bound texture slots (bit = handle slot) sampled as stencil: usampler2D
 } ShaderKey;
 
 typedef struct {
@@ -74,6 +75,7 @@ typedef struct {
     bool uses_tint;        // fragment: reads the per-draw tint (buffer 19, float4[2]) applied to color target 0
     bool uses_rscale;       // reads the resolution-scale table (fragment/compute buffer 18): float4 [0] = render
                             // target scale, [1 + i] = allocation scale of texture i
+    bool uses_images;       // (GLSL compute) SUST: storage images img0..7 at SHADER_IMAGE_BINDING + slot
     uint32_t local_mem;     // bytes of local memory
     uint32_t num_insts;
     char error[256];        // set when translation fails
@@ -88,6 +90,9 @@ typedef struct {
 // gmem_ covers words [0, GMEM_LO_WORDS), gmemh_ words from maxwell_gmem_hi_word on (translate.c gmem_split)
 #define GMEMH_BUFFER_INDEX 22
 #define GMEM_LO_WORDS 0x20000000u  // 2 GB
+// (GLSL compute, Vulkan) image slot i (nvnCommandBufferBindImage) -> storage image binding SHADER_IMAGE_BINDING + i
+#define SHADER_IMAGE_BINDING 64
+#define SHADER_MAX_IMAGES 8
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
