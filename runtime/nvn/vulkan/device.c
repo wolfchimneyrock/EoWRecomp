@@ -778,6 +778,13 @@ void backend_present(NvnTexture *t) {
     static long debug_n = -1;
     if (debug_n < 0) { const char *e = getenv("EOWRECOMP_DEBUG_FRAMES"); debug_n = e && atol(e) > 1 ? atol(e) : 1; }
     g_debug_frame = debug_at && total_frames >= (uint64_t)debug_at && total_frames < (uint64_t)debug_at + (uint64_t)debug_n;
+    extern long g_debug_frame_index;  // 0-based index inside the EOWRECOMP_DEBUG_FRAMES series (EOWRECOMP_SKIP_VS)
+    g_debug_frame_index = g_debug_frame ? (long)total_frames - debug_at : -1;
+    {   // EOWRECOMP_SKIP_VS_CYCLE=<P>: no debug frame needed; block b = (frame / P) % 16 skips EOWRECOMP_SKIP_VS entry b-1
+        static long cyc = -1;
+        if (cyc < 0) { const char *e = getenv("EOWRECOMP_SKIP_VS_CYCLE"); cyc = e ? atol(e) : 0; }
+        if (cyc > 0) g_debug_frame_index = (long)(total_frames / (uint64_t)cyc) % 16;
+    }
     {   // EOWRECOMP_GPUPROF_AT=<frame>[,<frame>...]: GPU time per pass of those frames ("[gpuprof]" in the log)
         extern bool g_gpuprof_frame;
         extern void vk_gpuprof_report(void);

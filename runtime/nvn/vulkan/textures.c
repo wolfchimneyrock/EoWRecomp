@@ -184,11 +184,35 @@ void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
 void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
 uint64_t renderer_present_count(void);
 
+// (debug) EOWRECOMP_NOSCALE_FMT=<hex>,<hex>: these nvn formats stay at guest size; EOWRECOMP_NOSCALE_MAXW=<w>: so do
+// targets narrower than w. EOWRECOMP_LOG_SCALE=1 logs each distinct scaled (format, size) once.
 static bool tex_scalable(const NvnTexture *t) {
     if (getenv("EOWRECOMP_NO_SCALE")) return false;
     if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
     float a = (float)t->width / (float)t->height;
-    return a > 1.74f && a < 1.81f;
+    if (!(a > 1.74f && a < 1.81f)) return false;
+    const char *e = getenv("EOWRECOMP_NOSCALE_FMT");
+    for (const char *p = e; p && *p;) {
+        char *end; unsigned long f = strtoul(p, &end, 16);
+        if (end == p) break;
+        if (f == t->format) return false;
+        p = *end ? end + 1 : end;
+    }
+    // Half- and quarter-size targets (lighting / AO helpers: R8 352x198, D24S8 704x396, ...) stay at the game's size.
+    // The game derives per-pixel patterns from their guest texel size; scaled, they drew a screen-fixed blocky grid of
+    // lit rectangles over every room (like LAS Recomp's AO fix d4d2754). Full-size targets (1280+) still scale.
+    // EOWRECOMP_NOSCALE_MAXW=<w> changes the cut-off (0 = scale everything, the old behaviour).
+    static int maxw = -1;
+    if (maxw < 0) { const char *mw = getenv("EOWRECOMP_NOSCALE_MAXW"); maxw = mw ? atoi(mw) : 1000; }
+    if (t->width < (uint32_t)maxw) return false;
+    if (getenv("EOWRECOMP_LOG_SCALE")) {
+        static uint64_t seen[64]; static int n;
+        uint64_t k = (uint64_t)t->format << 32 | t->width << 16 | t->height;
+        bool dup = false;
+        for (int i = 0; i < n; i++) dup |= seen[i] == k;
+        if (!dup && n < 64) { seen[n++] = k; LOG("[scale] fmt %#x %ux%u scaled\n", t->format, t->width, t->height); }
+    }
+    return true;
 }
 
 bool renderer_texture_first_write(NvnTexture *t) {
@@ -428,6 +452,14 @@ static TexBackend *tex_backend(NvnTexture *t) {
     }
     vk_collect_dead();
     b = calloc(1, sizeof *b);
+    {   // (debug) EOWRECOMP_LOG_FORMATS=1: each distinct nvn texture format once, with its first size and swizzle
+        static int lf = -1;
+        static uint8_t seenf[256];
+        if (lf < 0) lf = getenv("EOWRECOMP_LOG_FORMATS") != NULL;
+        if (lf && t->format < 256 && !seenf[t->format]++)
+            LOG("[fmt] nvn %#x %ux%u target %u flags %#x swizzle %u %u %u %u\n", t->format, t->width, t->height, t->target,
+                t->flags, t->swizzle[0], t->swizzle[1], t->swizzle[2], t->swizzle[3]);
+    }
     b->scalable = tex_scalable(t);
     create_image(t, b);
     t->backend = b;
