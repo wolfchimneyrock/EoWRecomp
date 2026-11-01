@@ -214,6 +214,11 @@ int main(int argc, char **argv) {
     }
     if (getenv("EOWRECOMP_NO_LAUNCHER") || getenv("EOWRECOMP_INPUT")) skip_launcher = true;
 #endif
+    {   // (the start screen reads the game data too: its background is a frame of the title movie)
+        static char romfs[4200];
+        snprintf(romfs, sizeof romfs, "%s/romfs", root);
+        g_romfs_dir = romfs;
+    }
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, settings
             extern void launcher_run(const char *root);

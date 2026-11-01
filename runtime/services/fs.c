@@ -395,13 +395,15 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
 
 #define ROMFS_PKG_FD 0x7FFFFFF0  // (romfs_fd while the RomFS comes from the package: rom_pread's tag, never a real fd)
 
-static Service *open_romfs_storage(void) {
+// opens the RomFS once; false = not there (why)
+static bool romfs_try_open(char *why, size_t why_size) {
+    if (!g_romfs_dir) return snprintf(why, why_size, "no game folder"), false;
     if (romfs_fd < 0) {
-        char path[1024], src[1024], why[512] = "";
+        char path[1024], src[1024];
         snprintf(path, sizeof path, "%s.bin", g_romfs_dir);  // extracted/romfs.bin
         snprintf(src, sizeof src, "%s.src", g_romfs_dir);    // extracted/romfs.src
         romfs_fd = open(path, O_RDONLY);
-        if (romfs_fd < 0 && (romfs_pkg = nx_romfs_open(src, why, sizeof why))) {
+        if (romfs_fd < 0 && (romfs_pkg = nx_romfs_open(src, why, why_size))) {
             romfs_fd = ROMFS_PKG_FD;
             LOG("[fs] romfs from the game package (%llu bytes)\n", (unsigned long long)nx_romfs_size(romfs_pkg));
         }
@@ -414,13 +416,47 @@ static Service *open_romfs_storage(void) {
                 LOG("[fs] romfs from the folder %s (%llu bytes, no image written)\n", g_romfs_dir,
                     (unsigned long long)romfs_virt_size(romfs_dirimg));
             } else if (why2[0]) {
-                snprintf(why, sizeof why, "%s", why2);
+                snprintf(why, why_size, "%s", why2);
             }
         }
-        if (romfs_fd < 0) FATAL("cannot open %s, %s or the folder %s: %s (set up the game files on the start screen)\n",
-                                path, src, g_romfs_dir, why);
+        if (romfs_fd < 0) return false;
         rom_index(romfs_fd);
     }
+    return true;
+}
+
+static void romfs_ensure(void) {
+    char why[512] = "";
+    if (!romfs_try_open(why, sizeof why))
+        FATAL("cannot open %s.bin or %s.src: %s (set up the game files on the start screen)\n", g_romfs_dir, g_romfs_dir, why);
+}
+
+// A file of the game's RomFS by its path ("region_common/movie/x.webm"): where it is in the image. For the movies
+// (runtime/hle/movie.c), which FFmpeg reads straight from the image - so they play when the RomFS is read from the
+// player's game package (romfs.src) and there is no extracted romfs/ folder.
+bool romfs_file_find(const char *path, uint64_t *off, uint64_t *size) {
+    char why[512];
+    if (!romfs_try_open(why, sizeof why)) return false;  // (the start screen asks too: no fatal error there)
+    while (*path == '/') path++;
+    for (int i = 0; i < rom_nfiles; i++)
+        if (!strcmp(rom_files[i].path, path)) {
+            *off = rom_files[i].off, *size = rom_files[i].size;
+            return true;
+        }
+    return false;
+}
+
+// The start screen is done with the game data (its background): closed again, so deleting or setting up the game
+// files anew finds nothing open; the game opens it afresh
+void romfs_release(void) { fs_reset(); }
+
+ssize_t romfs_image_read(void *dst, uint64_t size, uint64_t off) {
+    romfs_ensure();
+    return romfs_read(romfs_fd, (uint8_t *)dst, size, off);
+}
+
+static Service *open_romfs_storage(void) {
+    romfs_ensure();
     Storage *st = calloc(1, sizeof *st);
     st->fd = romfs_fd;
     if (romfs_pkg) st->size = nx_romfs_size(romfs_pkg);

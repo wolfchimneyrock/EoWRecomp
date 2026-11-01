@@ -17,6 +17,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "../hle.h"
 #include "../settings.h"
@@ -162,8 +165,62 @@ static void signal_guest_event(Cpu *c, uint64_t event) {
 static void ok(Cpu *c) { c->x[0] = 0; }
 
 // ------------------------------------------------------------------ Extractor
+// A movie read straight from the RomFS image (services/fs.c): the game package or romfs.bin, no loose files needed
+typedef struct { uint64_t off, size, pos; } RomIo;
+extern bool romfs_file_find(const char *path, uint64_t *off, uint64_t *size);
+extern ssize_t romfs_image_read(void *dst, uint64_t size, uint64_t off);
+
+static int romio_read(void *opaque, uint8_t *buf, int n) {
+    RomIo *r = opaque;
+    if (r->pos >= r->size) return AVERROR_EOF;
+    if ((uint64_t)n > r->size - r->pos) n = (int)(r->size - r->pos);
+    ssize_t got = romfs_image_read(buf, (uint64_t)n, r->off + r->pos);
+    if (got <= 0) return AVERROR_EOF;
+    r->pos += (uint64_t)got;
+    return (int)got;
+}
+
+static int64_t romio_seek(void *opaque, int64_t to, int whence) {
+    RomIo *r = opaque;
+    whence &= ~AVSEEK_FORCE;
+    if (whence == AVSEEK_SIZE) return (int64_t)r->size;
+    int64_t p = whence == SEEK_SET ? to : whence == SEEK_CUR ? (int64_t)r->pos + to : whence == SEEK_END ? (int64_t)r->size + to : -1;
+    if (p < 0) return -1;
+    r->pos = (uint64_t)p;
+    return p;
+}
+
+// Opens *fmt on the RomFS file at rel (*pb: its reader, for romio_close after avformat_close_input). false = not in
+// the RomFS / no RomFS. Also the start screen's background (runtime/ui/launcher.mm).
+bool romio_open(AVFormatContext **fmt, AVIOContext **pb, const char *rel) {
+    uint64_t off, size;
+    if (!romfs_file_find(rel, &off, &size)) return false;
+    RomIo *r = calloc(1, sizeof *r);
+    r->off = off, r->size = size;
+    unsigned char *buf = av_malloc(1 << 16);
+    *pb = avio_alloc_context(buf, 1 << 16, 0, r, romio_read, NULL, romio_seek);
+    *fmt = avformat_alloc_context();
+    (*fmt)->pb = *pb;
+    (*fmt)->flags |= AVFMT_FLAG_CUSTOM_IO;
+    if (avformat_open_input(fmt, rel, NULL, NULL) < 0) {  // (frees *fmt on failure)
+        av_free((*pb)->buffer);
+        avio_context_free(pb);
+        free(r);
+        return false;
+    }
+    return true;
+}
+
+void romio_close(AVIOContext **pb) {
+    if (!*pb) return;
+    free((*pb)->opaque);
+    av_free((*pb)->buffer);
+    avio_context_free(pb);
+}
+
 typedef struct {
     AVFormatContext *fmt;
+    AVIOContext *pb;       // (a movie read from the RomFS image: its reader)
     int map[16], ntracks;  // exposed track -> stream
     uint64_t selected;  // bitmask of streams
     AVPacket *pkt;
@@ -218,15 +275,26 @@ static void ex_set_data_source(Cpu *c) {
     char host[1024];
     snprintf(host, sizeof host, "%s/%s", g_romfs_dir, rel ? rel : "");
     LOG("[movie] open %s -> %s\n", path ? path : "(null)", host);
-    if (avformat_open_input(&e->fmt, host, NULL, NULL) < 0 || avformat_find_stream_info(e->fmt, NULL) < 0) {
+    struct stat st;
+    bool opened;
+    if (rel && stat(host, &st) != 0) {  // no loose file: from the RomFS image itself
+        opened = romio_open(&e->fmt, &e->pb, rel);
+        if (opened) LOG("[movie] %s: from the game data image\n", rel);
+    } else {
+        opened = avformat_open_input(&e->fmt, host, NULL, NULL) >= 0;
+    }
+    if (!opened || avformat_find_stream_info(e->fmt, NULL) < 0) {
         LOG("[movie] cannot open %s\n", host);
+        if (e->fmt) avformat_close_input(&e->fmt);
+        romio_close(&e->pb);
         c->x[0] = 1;
         return;
     }
     e->pkt = av_packet_alloc();
     e->ntracks = 0;
     // the opening at launch can always be skipped, vanilla and randomizer (with no save yet the game forces it)
-    e->skippable = rel && strstr(rel, "movie/opening.webm");
+    // (LAS Recomp's movie/opening.webm; this game's is region_common/movie/rd004_Opening.webm)
+    e->skippable = rel && (strstr(rel, "movie/opening.webm") || strstr(rel, "_Opening.webm"));
     if (e->skippable) g_skip_pressed_at = 0;  // (a press that ended the title's attract replay isn't for this one)
     for (unsigned i = 0; i < e->fmt->nb_streams && e->ntracks < 16; i++)
         if (e->fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ||
@@ -346,6 +414,7 @@ static void movie_track(int kind, void *p, bool add) {
 static void ex_dtor(Cpu *c) {
     Extractor *e = self_state(c);
     if (e && e->fmt) avformat_close_input(&e->fmt);
+    if (e) romio_close(&e->pb);
     if (e) movie_track(0, e, false);
     c->x[0] = 0;
 }
@@ -763,6 +832,7 @@ RT_ON_RESET(movie_reset) {
     for (int i = 0; i < MAX_MOVIE_OBJS; i++) {
         Extractor *e = g_movie_objs[0][i];
         if (e && e->fmt) avformat_close_input(&e->fmt);
+        if (e) romio_close(&e->pb);
         Decoder *d = g_movie_objs[1][i];
         if (d && d->ctx) avcodec_free_context(&d->ctx);
         g_movie_objs[0][i] = g_movie_objs[1][i] = NULL;
