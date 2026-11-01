@@ -41,6 +41,7 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 static _Atomic int stat_compiles;
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
+long g_debug_frame_index = -1;
 static char stats_text[2048];
 void vk_collect_dead(void);
 
@@ -497,9 +498,10 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
             if (s->npools == 16) FATAL("descriptor pools exhausted\n");
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024}};
+                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
+                                            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8192}};  // (SUST compute: 8 per set)
             VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192,
-                                             .poolSizeCount = 5, .pPoolSizes = sizes};
+                                             .poolSizeCount = 6, .pPoolSizes = sizes};
             VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &s->pools[s->npools++]));
         }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -618,12 +620,79 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
     return s;
 }
 
+// Guest memory the GPU writes (storing shaders' bound storage buffers, gfast copy-backs). guest_copy snapshots guest
+// memory on the CPU when a draw is recorded, so a constant buffer / vertex range a compute dispatch filled earlier in the
+// frame used to be copied BEFORE the GPU had written it: the draw got last frame's (or garbage) data. (The Suthorn
+// Ruins void: it only drew right with EOWRECOMP_VK_DEVLOST_TRACE=2, which waits on the GPU after every pass.)
+// Now: the submission is closed at the next pass / dispatch boundary after such writes (gw_boundary), and a
+// guest_copy over a range the GPU hasn't finished writing waits for that submission first.
+// NOTE (tested 2026-10-31): this fixed the void, but gw_wait never fired there. The fix came from gw_boundary's extra
+// submissions. Likely cause: each submission's upload command buffer runs before its main one, so a later pass's
+// upload can overwrite data an earlier pass in the same submission still reads. Not yet confirmed.
+// EOWRECOMP_VK_GPU_WRITE_SYNC=0: off (the old behaviour). EOWRECOMP_LOG_GPU_WRITE_SYNC=1: log the waits.
+#define GW_MAX 512
+static struct { uint64_t lo, hi, seq; } gw[GW_MAX];  // absolute guest addresses [lo, hi), seq = submission writing them
+static int gw_n;
+static bool gw_open;  // the open (unsubmitted) submission has GPU writes to guest memory
+static int gw_on_ = -1;
+static bool gw_on(void) {
+    if (gw_on_ < 0) { const char *e = getenv("EOWRECOMP_VK_GPU_WRITE_SYNC"); gw_on_ = !e || atoi(e) != 0; }
+    return gw_on_;
+}
+static void gw_note(uint64_t lo, uint64_t hi) {
+    if (!gw_on() || hi <= lo) return;
+    uint64_t seq = vk_pending_seq(), done = vk_completed_seq();
+    int free_i = -1;
+    for (int i = 0; i < gw_n; i++) {
+        if (gw[i].lo == lo && gw[i].hi == hi) { gw[i].seq = seq; gw_open = true; return; }
+        if (free_i < 0 && gw[i].seq <= done) free_i = i;
+    }
+    if (free_i < 0) {
+        if (gw_n < GW_MAX) free_i = gw_n++;
+        else {  // (full: the oldest entry goes after waiting for it)
+            free_i = 0;
+            for (int i = 1; i < gw_n; i++) if (gw[i].seq < gw[free_i].seq) free_i = i;
+            if (gw[free_i].seq <= submit_seq) vk_wait_seq(gw[free_i].seq);
+        }
+    }
+    gw[free_i].lo = lo; gw[free_i].hi = hi; gw[free_i].seq = seq;
+    gw_open = true;
+}
+void renderer_submit(void);
+// At a pass / dispatch boundary (outside any render pass): submit work that wrote guest memory, so later snapshots
+// of it can wait for it.
+static void gw_boundary(void) {
+    if (!gw_open) return;
+    gw_open = false;
+    renderer_submit();
+}
+// Before the CPU reads guest memory [addr, addr+size) for the GPU: wait for GPU writes to it still in flight.
+static void gw_wait(uint64_t addr, uint64_t size) {
+    if (!gw_n) return;
+    uint64_t need = 0, done = 0;
+    bool have_done = false;
+    for (int i = 0; i < gw_n; i++) {
+        if (gw[i].hi <= addr || gw[i].lo >= addr + size || gw[i].seq <= need) continue;
+        if (!have_done) { done = vk_completed_seq(); have_done = true; }
+        if (gw[i].seq > done && gw[i].seq <= submit_seq) need = gw[i].seq;  // (unsubmitted = same pass: can't wait)
+    }
+    if (!need) return;
+    if (getenv("EOWRECOMP_LOG_GPU_WRITE_SYNC")) {
+        static int nlog;
+        if (nlog++ < 40) LOG("[gwsync] guest read %llx+%llx waits for GPU writes (seq %llu, done %llu)\n", (unsigned long long)addr,
+                             (unsigned long long)size, (unsigned long long)need, (unsigned long long)done);
+    }
+    wait_why = "guest read after GPU write";
+    vk_wait_seq(need);
+}
+
 // Guest memory copied once per submission: draws binding the same range share the copy.
 #define GCOPY_TAB 4096
 static struct { uint64_t addr, size, seq; VkSpan span; } gcopy[GCOPY_TAB];
 static uint64_t gcopy_gen;  // bumped to drop every shared copy (guest memory written mid-list)
 static void guest_copy_flush(void) { gcopy_gen++; }
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
+    gw_wait(addr, size);
     uint64_t seq = vk_pending_seq() + (gcopy_gen << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
     if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && gcopy[slot].size == size) return gcopy[slot].span;
@@ -992,12 +1061,15 @@ static inline bool ss_need(uint32_t bit, bool same) {
 static void vk_end_pass_at(int line);
 void vk_end_pass(void) { vk_end_pass_at(0); }
 #define vk_end_pass() vk_end_pass_at(__LINE__)
+// the pass's first color target, latched by begin_pass: by the time a pass ends, st.rt may already describe the next
+// pass (begin_pass ends the old pass after the targets changed), so the debug dump must not read st.rt then
+static TexBackend *pass_rt0;
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
     if (prof && line < 4096) prof_end_line[line]++;
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
-    if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
+    if (g_debug_frame && pass_rt0) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
         static int multi = -1;
@@ -1005,7 +1077,7 @@ static void vk_end_pass_at(int line) {
         if (multi && renderer_present_count() != debug_pass_frame) { debug_pass_frame = renderer_present_count(); debug_pass_no = 0; }
         if (multi) snprintf(path, sizeof path, "build/pass_%llu_%03d.png", (unsigned long long)debug_pass_frame, debug_pass_no++);
         else snprintf(path, sizeof path, "build/pass_%03d.png", debug_pass_no++);
-        renderer_save_texture_tex(st.rt.color[0]->backend, path);
+        renderer_save_texture_tex(pass_rt0, path);
     }
 }
 
@@ -1015,6 +1087,7 @@ static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
     if (dl_on >= 2) renderer_flush();  // (EOWRECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
+    gw_boundary();
     st.rt_dirty = false;
     VkCommandBuffer cb = vk_cmd();
     vk_barrier_ex(cb, true);  // passes, copies and dispatches see each other's results
@@ -1088,6 +1161,7 @@ static void begin_pass(void) {
     vkCmdBeginRendering(cb, &ri);
     ss_forget();  // (whatever ran between the passes may have set its own state)
     in_pass = true;
+    pass_rt0 = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
 }
@@ -1241,6 +1315,9 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
     begin_pass();
+    if (g_debug_frame)
+        LOG("[clear] index %d mask %#x depth %d (%.6f) stencil %d (%u mask %#x) | rt0 %p ds %p\n", index, mask, depth, dval, stencil,
+            sval, smask, st.rt.ncolor ? (void *)st.rt.color[0] : NULL, (void *)st.rt.depth);
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     VkRect2D rect = scissor_rect();
@@ -1422,6 +1499,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    for (int k = 0; k < 4; k++) { h ^= (fkey->stencil_tex >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; }
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
@@ -1717,6 +1795,7 @@ static void build_pipeline(void *arg) {
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
 static NvnTexture *feedback_tex[4];
 static VkImageView feedback_view[4];
+static TexBackend *feedback_snap[4];  // the snapshot image behind feedback_view (stencil views: texture_info)
 static int nfeedback;
 static uint64_t g_cur_fs_hash;
 static NvnTexture *snap_tex[8];
@@ -1737,6 +1816,18 @@ static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
     return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+}
+
+// Bound texture slot `slot` of `stage` samples the STENCIL of a depth-stencil texture (NVN depth-stencil mode 1, set
+// on the texture view or the texture itself): the shader reads integer stencil values.
+static bool slot_samples_stencil(int stage, int slot) {
+    uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    uint32_t tic = h & 0xFFFFF;
+    if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return false;
+    NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+    if (!e->tex || !renderer_format_has_stencil(e->tex->format)) return false;
+    uint32_t mode = e->has_view && (e->view.setmask & 16) ? e->view.ds_mode : e->tex->ds_mode;
+    return mode == 1;
 }
 
 static bool is_attachment(NvnTexture *t) {
@@ -1776,7 +1867,9 @@ static TexBackend *snapshot_image(NvnTexture *t, TexBackend *src) {
 
 // (debug frames) a depth image's depth values as a greyscale PGM, stretched over its own min..max
 static void debug_save_depth(TexBackend *b, const char *path) {
-    if (!b || !b->image || !(b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || b->format != VK_FORMAT_D32_SFLOAT_S8_UINT) return;
+    if (!b || !b->image || !(b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return;
+    bool d24 = b->format == VK_FORMAT_D24_UNORM_S8_UINT;  // (readback: 24-bit unorm in the low bits of 32)
+    if (!d24 && b->format != VK_FORMAT_D32_SFLOAT_S8_UINT) return;
     uint64_t n = (uint64_t)b->width * b->height;
     VkSpan out = vk_readback(n * 4);
     VkCommandBuffer cb = vk_cmd();
@@ -1785,9 +1878,12 @@ static void debug_save_depth(TexBackend *b, const char *path) {
                            .imageExtent = {b->width, b->height, 1}};
     vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
     renderer_flush();
-    const float *d = out.ptr;
+    float *d = out.ptr;
+    if (d24) for (uint64_t i = 0; i < n; i++) d[i] = (float)(((const uint32_t *)out.ptr)[i] & 0xFFFFFF) / 16777215.0f;
     float lo = 1e30f, hi = -1e30f;
-    for (uint64_t i = 0; i < n; i++) { if (d[i] < lo) lo = d[i]; if (d[i] > hi) hi = d[i]; }
+    uint64_t ones = 0;
+    for (uint64_t i = 0; i < n; i++) { if (d[i] < lo) lo = d[i]; if (d[i] > hi) hi = d[i]; ones += d[i] >= 1.0f; }
+    LOG("[vk] depth %s: %llu of %llu texels are 1.0\n", path, (unsigned long long)ones, (unsigned long long)n);
     FILE *f = fopen(path, "wb");
     if (!f) return;
     fprintf(f, "P5 %u %u 255\n", b->width, b->height);
@@ -2005,6 +2101,7 @@ static void resolve_feedback(Prog *pr) {
             static const VkComponentMapping id = {0};
             if (!nosnap && si >= 0 && (snap_ok[si] || self_write) && existing) {
                 feedback_tex[nfeedback] = t;
+                feedback_snap[nfeedback] = &existing->copy;
                 feedback_view[nfeedback++] = vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
                 continue;
             }
@@ -2028,6 +2125,7 @@ static void resolve_feedback(Prog *pr) {
                 cb = vk_cmd();
             }
             feedback_tex[nfeedback] = t;
+            feedback_snap[nfeedback] = dst;
             feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
             snap_ok[si] = true;
@@ -2072,6 +2170,14 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
         uint64_t size = ss->const_size ? ss->const_size : 16;
         if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
         return ubo_span(guest_copy(ss->code_addr + ss->const_offset, size), size);  // (constant: shared per submission)
+    }
+    if (k == 2) {  // driver cbuf: bound texture handles at 0x20 + 8 * slot, image handles at 0x120 + 8 * slot
+        uint32_t drv[0x200 / 4] = {0};
+        for (int i = 0; i < 32; i++) { drv[(0x20 + 8 * i) / 4] = (uint32_t)st.tex[stage][i]; drv[(0x24 + 8 * i) / 4] = (uint32_t)(st.tex[stage][i] >> 32); }
+        for (int i = 0; i < 8; i++) { drv[(0x120 + 8 * i) / 4] = (uint32_t)st.img[stage][i]; drv[(0x124 + 8 * i) / 4] = (uint32_t)(st.img[stage][i] >> 32); }
+        uint64_t size = si->cbuf_size[2] ? si->cbuf_size[2] : 256;
+        if (size > sizeof drv) size = sizeof drv;  // (the shader's cb2[] is bounds-clamped by robustBufferAccess)
+        return ubo_span(vk_transient_copy(drv, size, 256), size);
     }
     int idx = k - 3;  // cbuf_base
     Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
@@ -2451,6 +2557,12 @@ static void vc_mark_sbufs(int stage) {
     }
 }
 
+// (the same ranges for gw_wait: later CPU snapshots of them wait for this work)
+static void gw_note_sbufs(int stage) {
+    for (int i = 0; i < 16; i++)
+        if (st.sbuf[stage][i].addr && st.sbuf[stage][i].size) gw_note(st.sbuf[stage][i].addr, st.sbuf[stage][i].addr + st.sbuf[stage][i].size);
+}
+
 static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
     if (vc_on < 0) {
         const char *e = getenv("EOWRECOMP_VK_VCACHE");
@@ -2635,11 +2747,21 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                 memo[ms].tex = e->tex; memo[ms].vh = vh; memo[ms].frame = frame; memo[ms].gen = vk_view_gen;
                 memo[ms].type = (uint8_t)st_->type; memo[ms].has_view = e->has_view; memo[ms].view = view;
             }
+            if (g_debug_frame && renderer_format_has_stencil(e->tex->format))
+                LOG("[texinfo] stage %d slot %d tic %u tex %p has_view %d setmask %#x view.ds_mode %u tex.ds_mode %u type %d -> view %p\n",
+                    stage, slot, tic, (void *)e->tex, e->has_view, e->has_view ? e->view.setmask : 0, e->has_view ? e->view.ds_mode : 0,
+                    e->tex->ds_mode, st_->type, (void *)view);
             renderer_texture_scale(e->tex, &sc[0], &sc[1]);
             wh[0] = e->tex->width; wh[1] = e->tex->height;
             for (int k = 0; k < nfeedback; k++)
                 if (e->tex == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
                     view = feedback_view[k];
+                    TexBackend *fs = feedback_snap[k];
+                    if (st_->type == TEXTYPE_2D && !st_->shadow && fs && (fs->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+                        slot_samples_stencil(stage, slot)) {  // (stencil sampling: the snapshot's stencil aspect)
+                        static const VkComponentMapping idm = {0};
+                        view = vk_image_view(fs, VK_IMAGE_VIEW_TYPE_2D, fs->format, 0, 1, 0, 1, idm, VK_IMAGE_ASPECT_STENCIL_BIT);
+                    }
                     if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
                 }
         }
@@ -2685,6 +2807,17 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
             bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info() : b->binding == GMEMH_BUFFER_INDEX ? gmemh_info() : gmem_info();
             w[n].pBufferInfo = &bi[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && b->binding >= SHADER_IMAGE_BINDING &&
+                   b->binding < SHADER_IMAGE_BINDING + SHADER_MAX_IMAGES) {  // (SUST) image slot -> storage view
+            uint64_t h = st.img[stage][b->binding - SHADER_IMAGE_BINDING];
+            uint32_t tic = (uint32_t)(h & 0xFFFFF);
+            VkImageView v = VK_NULL_HANDLE;
+            if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
+                NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+                if (e->tex) v = vk_storage_view(e->tex, &e->view, e->has_view);
+            }
+            ii[n] = (VkDescriptorImageInfo){VK_NULL_HANDLE, v ? v : vk_dummy_storage_view(), VK_IMAGE_LAYOUT_GENERAL};
+            w[n].pImageInfo = &ii[n];
         } else {
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
         }
@@ -2791,6 +2924,28 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         if (skip == ~0ull) { const char *e = getenv("EOWRECOMP_SKIP_CS"); skip = e ? strtoull(e, NULL, 16) : 0; }
         if (skip && st.program->stages[5].code_addr == skip) { SKIP(SKIP_LIST); return; }
     }
+    if (getenv("EOWRECOMP_LOG_CS_IMG")) {  // (debug) image / texture handles bound for compute
+        static uint64_t seen_ci[16];
+        static int seen_cn[16];
+        int k = 0;
+        while (k < 15 && seen_ci[k] && seen_ci[k] != st.program->stages[5].code_addr) k++;
+        seen_ci[k] = st.program->stages[5].code_addr;
+        if (seen_cn[k]++ < 8) {
+            LOG("[csimg] %llx %ux%ux%u local %ux%ux%u img:", (unsigned long long)st.program->stages[5].code_addr, gx, gy, gz,
+                cp->local[0], cp->local[1], cp->local[2]);
+            for (int i = 0; i < 8; i++) if (st.img[5][i]) LOG(" %d=%llx", i, (unsigned long long)st.img[5][i]);
+            LOG(" tex:");
+            for (int i = 0; i < 32; i++) if (st.tex[5][i]) LOG(" %d=%llx", i, (unsigned long long)st.tex[5][i]);
+            for (int i = 0; i < 8; i++) {
+                uint32_t tic = (uint32_t)(st.img[5][i] & 0xFFFFF);
+                if (st.img[5][i] && st.tpool && tic < (uint32_t)st.tpool->count) {
+                    NvnTexture *t = ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+                    if (t) LOG(" [img%d %p fmt %#x %ux%u]", i, (void *)t, t->format, t->width, t->height);
+                }
+            }
+            LOG("\n");
+        }
+    }
     if (cp->si->uses_gmem && getenv("EOWRECOMP_LOG_CS_SBUF")) {  // (debug) the storage buffers bound to gmem dispatches
         static uint64_t seen_cs[16];
         static int seen_n[16];
@@ -2805,6 +2960,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         }
     }
     vk_end_pass();
+    gw_boundary();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
@@ -2826,8 +2982,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     vkCmdDispatch(cb, gx, gy, gz);
+    if (cp->si->uses_images) vk_full_barrier(cb);  // (image stores: visible to the next draws' sampling)
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
-    if (cp->si->uses_gmem_store) vc_mark_sbufs(5);
+    if (cp->si->uses_gmem_store) { vc_mark_sbufs(5); gw_note_sbufs(5); }
     stat_dispatches++;
 }
 
@@ -2880,8 +3037,28 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+    for (int i = 0; i < 32; i++) if (st.tex[1][i] && slot_samples_stencil(1, i)) fkey.stencil_tex |= 1u << i;
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return; }
+    {   // EOWRECOMP_SKIP_VS=<vs>[/<count>],...: during a debug-frame series (EOWRECOMP_DEBUG_FRAME + _FRAMES), frame k of
+        // the series skips the draws matching entry k-1 (frame 0 skips nothing): one candidate per frame, only for one frame
+        static uint64_t svs[32], scnt[32];
+        static int nsvs = -1;
+        if (nsvs < 0) {
+            nsvs = 0;
+            for (const char *p = getenv("EOWRECOMP_SKIP_VS"); p && *p && nsvs < 32;) {
+                svs[nsvs] = strtoull(p, (char **)&p, 16);
+                scnt[nsvs] = *p == '/' ? strtoull(p + 1, (char **)&p, 10) : 0;
+                nsvs++;
+                while (*p == ',') p++;
+            }
+        }
+        long k = g_debug_frame_index - 1;
+        if (k >= 0 && k < nsvs && st.program->stages[0].code_addr == svs[k] && (!scnt[k] || r->x[2] == scnt[k])) {
+            SKIP(SKIP_LIST);
+            return;
+        }
+    }
     {   // fragment-shader hash: skip lists (EOWRECOMP_SKIP_FSHASH), debug logging
         static uint64_t last_fs, last_hash;
         uint64_t fs = st.program->stages[1].code_addr;
@@ -2907,7 +3084,8 @@ static void draw_(CmdRec *r, bool indexed) {
     alias_draw_check();
     resolve_feedback(pr);
     snap_reason = "draw-depthwrite";
-    if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
+    if (st.rt.depth && ((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF))))
+        snapshots_invalidate(st.rt.depth);  // (stencil writes too: stencil-sampling draws read the snapshot)
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
@@ -3115,8 +3293,8 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);  // (always new sets)
-    if (pr->vi->uses_gmem_store) vc_mark_sbufs(0);
-    if (pr->fi->uses_gmem_store) vc_mark_sbufs(1);
+    if (pr->vi->uses_gmem_store) { vc_mark_sbufs(0); gw_note_sbufs(0); }
+    if (pr->fi->uses_gmem_store) { vc_mark_sbufs(1); gw_note_sbufs(1); }
     if (dl_on >= 3)
         dl_note("  draw vs %llx fs %llx fshash %016llx count %u", (unsigned long long)st.program->stages[0].code_addr,
                 (unsigned long long)st.program->stages[1].code_addr, (unsigned long long)g_cur_fs_hash, (uint32_t)r->x[2]);
@@ -3278,12 +3456,56 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             LOG("\n");
         }
     }
+    static int dump_td = -1;
+    if (dump_td < 0) dump_td = getenv("EOWRECOMP_DUMP_TEX_DEPTH") != NULL;
+    for (int i = 0; dump_td && i < pr->fi->ntex && i < 64; i++) {  // (debug: sampled depth textures, as the draw will see them)
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        static int nd;
+        if (!t || !renderer_format_has_stencil(t->format) || nd >= 40) continue;
+        TexBackend *tb = vk_tex(t, false);  // (the lookup texture binding does: any upload happens here)
+        if (naliases) tb = vk_tex(alias_read(t), false);
+        vk_end_pass();
+        st.rt_dirty = true;
+        char path[128];
+        snprintf(path, sizeof path, "build/drawdepth_%03d_tex%d.pgm", nd++, i);
+        LOG("[draw]   dumping tex%d %p -> %s\n", i, (void *)t, path);
+        debug_save_depth(tb, path);
+    }
+    // (debug) EOWRECOMP_DUMP_DRAW_TEX=<fs code addr hex>: save that fragment program's colour textures (raw, no swizzle)
+    // once each, as build/drawtex_<fs>_<n>_tex<i>_f<fmt>.png
+    static const char *ddt = (const char *)1;
+    if (ddt == (const char *)1) ddt = getenv("EOWRECOMP_DUMP_DRAW_TEX");
+    if (ddt && strtoull(ddt, NULL, 16) == st.program->stages[1].code_addr) {
+        static void *done[64]; static int ndone;
+        for (int i = 0; i < pr->fi->ntex && i < 16; i++) {
+            NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+            if (!t || renderer_format_is_depth(t->format)) continue;
+            bool seen = false;
+            for (int k = 0; k < ndone; k++) seen |= done[k] == t;
+            if (seen || ndone >= 64) continue;
+            done[ndone++] = t;
+            TexBackend *tb = vk_tex(t, false);
+            char path[160];
+            snprintf(path, sizeof path, "build/drawtex_%llx_%02d_tex%d_f%x.png", (unsigned long long)st.program->stages[1].code_addr,
+                     ndone, i, t->format);
+            LOG("[draw]   dumping tex%d %p -> %s (swizzle %u %u %u %u)\n", i, (void *)t, path, t->swizzle[0], t->swizzle[1],
+                t->swizzle[2], t->swizzle[3]);
+            renderer_save_texture_tex(tb, path);
+            st.rt_dirty = true;
+        }
+    }
     for (int i = 0; i < pr->fi->ntex && i < 64; i++) {  // fragment textures: guest size / format, allocation, scale
         NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
         const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
         if (!t) { LOG("[draw]   tex%d: none\n", i); continue; }
-        LOG("[draw]   tex%d: %p %ux%u f%#x lv %u -> %ux%u scale %.4f %.4f%s\n", i, (void *)t, t->width, t->height, t->format,
-            b ? b->levels : 0, b ? b->width : 0, b ? b->height : 0, b ? b->sx : 0, b ? b->sy : 0, b && b->scalable ? " scalable" : "");
+        int tslot = ((int)pr->fi->tex[i].handle_offset - 0x20) / 8;
+        uint64_t th = (tslot >= 0 && tslot < 32) ? st.tex[1][tslot] : 0;
+        uint32_t tsc = (uint32_t)(th >> 20) & 0xFFF;
+        const NvnSamplerDesc *sd = th && st.spool && tsc < (uint32_t)st.spool->count ? &((NvnSamplerDesc *)st.spool->entries)[tsc] : NULL;
+        LOG("[draw]   tex%d: %p %ux%u f%#x lv %u -> %ux%u scale %.4f %.4f%s%s | tsc %u cmp %d func %d shadow %d\n", i, (void *)t,
+            t->width, t->height, t->format, b ? b->levels : 0, b ? b->width : 0, b ? b->height : 0, b ? b->sx : 0, b ? b->sy : 0,
+            b && b->scalable ? " scalable" : "", slot_samples_stencil(1, tslot) ? " STENCIL" : "", tsc,
+            sd ? (int)sd->compare_mode : -1, sd ? (int)sd->compare_func : -1, (int)pr->fi->tex[i].shadow);
     }
 }
 
@@ -3462,6 +3684,14 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
         VkImageCopy c = {.srcSubresource = {sa, slv, sly, 1}, .srcOffset = {sx0, sy0, 0}, .dstSubresource = {da, dlv, dly, 1},
                          .dstOffset = {dx0, dy0, 0}, .extent = {(uint32_t)sw, (uint32_t)sh, 1}};
         vkCmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        if (g_debug_frame && (sa & VK_IMAGE_ASPECT_DEPTH_BIT) && slv == 0 && dlv == 0) {  // (debug: both sides, as PGM)
+            static int nc;
+            char path[128];
+            snprintf(path, sizeof path, "build/copydepth_%03d_src.pgm", nc);
+            debug_save_depth(s, path);
+            snprintf(path, sizeof path, "build/copydepth_%03d_dst.pgm", nc++);
+            debug_save_depth(d, path);
+        }
         return;
     }
     // scaled / converting copy: the game builds its depth pyramid this way (nearest), colour copies filter if asked

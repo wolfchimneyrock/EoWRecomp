@@ -81,6 +81,7 @@ typedef struct TexBackend {
     uint32_t width, height, depth, layers, levels, samples;
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic;
+    bool storage;  // created with VK_IMAGE_USAGE_STORAGE_BIT (compute image stores: vk_storage_view)
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     bool scalable, presented;
@@ -101,6 +102,10 @@ VkFormat vk_format(uint32_t nvn_format);
 bool vk_format_alpha_one(uint32_t nvn_format);
 // View of t (optionally through an NVN texture view) for rendering or sampling.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype);
+// Storage-image view (one level, one layer, 2D) for compute image stores; VK_NULL_HANDLE when t can't be stored to.
+// Marks t GPU-owned (no CPU re-upload over the results).
+VkImageView vk_storage_view(NvnTexture *t, const NvnTextureView *v, bool has_view);
+VkImageView vk_dummy_storage_view(void);  // 1x1 RGBA8 storage image for unbound image slots
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);

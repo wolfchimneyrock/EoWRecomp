@@ -170,11 +170,35 @@ void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
 void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
 uint64_t renderer_present_count(void);
 
+// (debug) EOWRECOMP_NOSCALE_FMT=<hex>,<hex>: these nvn formats stay at guest size; EOWRECOMP_NOSCALE_MAXW=<w>: so do
+// targets narrower than w. EOWRECOMP_LOG_SCALE=1 logs each distinct scaled (format, size) once.
 static bool tex_scalable(const NvnTexture *t) {
     if (getenv("EOWRECOMP_NO_SCALE")) return false;
     if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
     float a = (float)t->width / (float)t->height;
-    return a > 1.74f && a < 1.81f;
+    if (!(a > 1.74f && a < 1.81f)) return false;
+    const char *e = getenv("EOWRECOMP_NOSCALE_FMT");
+    for (const char *p = e; p && *p;) {
+        char *end; unsigned long f = strtoul(p, &end, 16);
+        if (end == p) break;
+        if (f == t->format) return false;
+        p = *end ? end + 1 : end;
+    }
+    // Half- and quarter-size targets (lighting / AO helpers: R8 352x198, D24S8 704x396, ...) stay at the game's size.
+    // The game derives per-pixel patterns from their guest texel size; scaled, they drew a screen-fixed blocky grid of
+    // lit rectangles over every room (like LAS Recomp's AO fix d4d2754). Full-size targets (1280+) still scale.
+    // EOWRECOMP_NOSCALE_MAXW=<w> changes the cut-off (0 = scale everything, the old behaviour).
+    static int maxw = -1;
+    if (maxw < 0) { const char *mw = getenv("EOWRECOMP_NOSCALE_MAXW"); maxw = mw ? atoi(mw) : 1000; }
+    if (t->width < (uint32_t)maxw) return false;
+    if (getenv("EOWRECOMP_LOG_SCALE")) {
+        static uint64_t seen[64]; static int n;
+        uint64_t k = (uint64_t)t->format << 32 | t->width << 16 | t->height;
+        bool dup = false;
+        for (int i = 0; i < n; i++) dup |= seen[i] == k;
+        if (!dup && n < 64) { seen[n++] = k; LOG("[scale] fmt %#x %ux%u scaled\n", t->format, t->width, t->height); }
+    }
+    return true;
 }
 
 bool renderer_texture_first_write(NvnTexture *t) {
@@ -310,6 +334,12 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    // compute shaders store to NVN images (SUST, e.g. the environment cubemap blend): storage usage where the format
+    // allows it; EXTENDED_USAGE lets format views without storage support (sRGB) still be created
+    if (!depthfmt && samples == 1 && type == VK_IMAGE_TYPE_2D && format_supports(vf, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+        usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    }
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
                             .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
@@ -326,6 +356,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         depthfmt = false;
     }
     b->format = vf;
+    b->storage = (ci.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
     b->width = tw; b->height = th; b->depth = depth; b->layers = layers; b->levels = levels; b->samples = samples;
     b->aspect = depthfmt ? aspect_of(t->format) : VK_IMAGE_ASPECT_COLOR_BIT;
     b->base_type = type == VK_IMAGE_TYPE_1D ? (layers > 1 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)
@@ -398,6 +429,14 @@ static TexBackend *tex_backend(NvnTexture *t) {
     }
     vk_collect_dead();
     b = calloc(1, sizeof *b);
+    {   // (debug) EOWRECOMP_LOG_FORMATS=1: each distinct nvn texture format once, with its first size and swizzle
+        static int lf = -1;
+        static uint8_t seenf[256];
+        if (lf < 0) lf = getenv("EOWRECOMP_LOG_FORMATS") != NULL;
+        if (lf && t->format < 256 && !seenf[t->format]++)
+            LOG("[fmt] nvn %#x %ux%u target %u flags %#x swizzle %u %u %u %u\n", t->format, t->width, t->height, t->target,
+                t->flags, t->swizzle[0], t->swizzle[1], t->swizzle[2], t->swizzle[3]);
+    }
     b->scalable = tex_scalable(t);
     create_image(t, b);
     t->backend = b;
@@ -704,11 +743,24 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
         return vk_image_view(b, type, fmt, lv0, 1, ly0, 1, IDENTITY, b->aspect);
     }
     VkImageAspectFlags aspect = b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect;
+    // NVN depth-stencil mode STENCIL (view or texture): sample the stencil aspect. The fragment shader declares
+    // these usampler2D (ShaderKey.stencil_tex, exec.c), so only plain 2D lookups get it.
+    uint32_t dsm = v && (v->setmask & 16) ? v->ds_mode : t->ds_mode;
+    if (dsm == 1 && (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && want_textype == TEXTYPE_2D) aspect = VK_IMAGE_ASPECT_STENCIL_BIT;
     VkComponentMapping sw = IDENTITY;
     if (!(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) && b->samples == 1) {
         const uint8_t *s = v && (v->setmask & 8) ? v->swizzle : t->swizzle;
         uint8_t c[4];
         for (int i = 0; i < 4; i++) c[i] = s[i] <= 5 ? s[i] : (uint8_t)(2 + i);
+        // NVN RGB565 (0x3C) has red in the low bits (NVN names formats lowest bits first), Vulkan's R5G6B5 has it in
+        // the high bits: swap red and blue. Unswapped, the heart HUD's mask texture read blue as red, so its alpha
+        // was ~1 everywhere (black hearts on a solid red box). EOWRECOMP_565_OLD=1 turns the swap off.
+        static int old565 = -1;
+        if (old565 < 0) old565 = getenv("EOWRECOMP_565_OLD") != NULL;
+        if (t->format == 0x3C && !old565 && b->format == VK_FORMAT_R5G6B5_UNORM_PACK16) {
+            if (!(c[0] || c[1] || c[2] || c[3])) { c[0] = 2; c[1] = 3; c[2] = 4; c[3] = 5; }
+            for (int i = 0; i < 4; i++) c[i] = c[i] == 2 ? 4 : c[i] == 4 ? 2 : c[i];
+        }
         if (c[0] || c[1] || c[2] || c[3]) {  // never set: identity
             if (fmt_of(t->format).alpha_one)
                 for (int i = 0; i < 4; i++) if (c[i] == 5) c[i] = 1;
@@ -767,6 +819,41 @@ VkImageView vk_dummy_view(int textype) {
     b->layers = cube ? 6 : 1;
     views[textype] = vk_image_view(b, vt, b->format, 0, 1, 0, cube ? 6 : 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
     return views[textype];
+}
+
+VkImageView vk_storage_view(NvnTexture *t, const NvnTextureView *v, bool has_view) {
+    TexBackend *b = vk_tex(t, true);  // (for_render: GPU-owned from now on)
+    if (!b->storage || b->samples > 1 || (b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) return VK_NULL_HANDLE;
+    if (!has_view) v = NULL;
+    VkFormat fmt = b->format;
+    if (v && (v->setmask & 4) && vk_format(t->format) == b->format) fmt = fmt_of(v->format).vf;
+    if (!format_supports(fmt, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+        static int nlog;
+        if (nlog++ < 20) LOG("[vk] storage view: format %d has no storage support (nvn %#x)\n", fmt, t->format);
+        return VK_NULL_HANDLE;
+    }
+    uint32_t lv0 = v && (v->setmask & 1) ? v->base_level : 0;
+    uint32_t ly0 = v && (v->setmask & 2) ? v->min_layer : 0;
+    if (lv0 >= b->levels) lv0 = b->levels - 1;
+    if (ly0 >= b->layers) ly0 = b->layers - 1;
+    return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, fmt, lv0, 1, ly0, 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+VkImageView vk_dummy_storage_view(void) {
+    static TexBackend b;
+    static VkImageView view;
+    if (view) return view;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+                            .extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b.image, &b.mem, NULL));
+    vk_image_init_layout(vk_upload_cmd(), b.image, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = b.image, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                .format = VK_FORMAT_R8G8B8A8_UNORM, .components = IDENTITY,
+                                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VK_CHECK(vkCreateImageView(g_vk.dev, &vi, NULL, &view));  // (not in view_tab: never evicted)
+    return view;
 }
 
 // ================================================================== samplers
