@@ -25,6 +25,8 @@ static const char *const skip_names[SKIP_NREASONS] = {"no program", "program com
 static uint64_t stat_skip_why[SKIP_NREASONS];
 #define SKIP(why) (stat_skipped++, stat_skip_why[why]++)
 static uint64_t stat_upload_bytes;
+static uint64_t stat_clean_bytes, stat_inval_bytes;  // (non-coherent heap import: CPU cache maintenance)
+static int heap_cc = -1;  // the heap import: -1 not known yet (none), 0 coherent, 1 not (heap_note_type)
 // EOWRECOMP_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
 static int prof = -1;
@@ -79,6 +81,8 @@ static void wait_account(uint64_t ns) {
 }
 
 static void cq_resolve_done(uint64_t done);
+static void gw_inval_done(uint64_t done);  // (the GPU's writes into a non-coherent heap import: with the gmem import below)
+static void heap_clean_flush(void);
 
 void vk_wait_seq(uint64_t seq) {
     if (!seq) { wait_why = NULL; return; }
@@ -90,7 +94,10 @@ void vk_wait_seq(uint64_t seq) {
     cum_wait += SDL_GetTicksNS() - t0;
     wait_account(SDL_GetTicksNS() - t0);
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
-    else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
+    else if (r == VK_SUCCESS) {
+        cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
+        gw_inval_done(seq);    // (non-coherent heap: the GPU's writes the CPU may read now)
+    }
     else {
         extern void vk_devlost_dump(void);
         vk_devlost_dump();
@@ -396,6 +403,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     VkCommandBufferSubmitInfo cbs[2];
     int n = 0;
     vc_flush();
+    heap_clean_flush();  // (non-coherent heap: what this submission reads, written back from the CPU's caches)
     if (s->upload_begun) {
         vk_full_barrier(s->upload);  // uploads complete before anything in the main buffer reads them
         VK_CHECK(vkEndCommandBuffer(s->upload));
@@ -804,6 +812,12 @@ const char *renderer_stats(void) {
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
              atomic_exchange(&stat_compiles, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
     stat_feedback_copies = stat_upload_bytes = 0;
+    if (stat_clean_bytes || stat_inval_bytes) {  // (non-coherent heap import)
+        size_t n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, ", cache clean %.1fMB inval %.1fMB", (double)stat_clean_bytes / 1048576.0,
+                 (double)stat_inval_bytes / 1048576.0);
+        stat_clean_bytes = stat_inval_bytes = 0;
+    }
     if (stat_skipped) {
         size_t n = strlen(stats_text);
         n += snprintf(stats_text + n, sizeof stats_text - n, " | skipped:");
@@ -975,6 +989,7 @@ static void begin_pass(void) {
     st.rt_dirty = false;
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
+    if (heap_cc > 0) gw_inval_done(vk_completed_seq());  // (non-coherent heap: the GPU's finished writes)
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -2042,6 +2057,91 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     return ubo_span(guest_copy(r.addr, size), size);
 }
 
+// ---- A heap import the CPU caches without coherency (Mali-G610 with Arm's driver: a host-pointer import can only be
+// memory type 1, HOST_VISIBLE | HOST_CACHED without HOST_COHERENT). What the CPU just wrote may still sit in its caches
+// when the GPU reads the heap, and the CPU may keep stale lines of what the GPU wrote there. In LAS Recomp on the same
+// GPU that was grass and shadows flashing and objects vanishing for a frame (LAS #526 / #546). There, every heap range
+// the GPU reads is written back (DC CVAC) before the submission that reads it goes to the GPU: the storage ranges bound
+// to shaders that use global memory, vertex / index data read in place, the GPU's copies out of the heap (vertex cache,
+// gfast). Each range once per submission, merged, at vk_submit_extra - after the game's last CPU write before it
+// submits, as on the Switch. The ranges a storing shader binds are written back and invalidated (DC CIVAC) when it is
+// recorded - no dirty CPU line can land on its results later - and again once its submission is done (any GPU wait,
+// each render pass start), so the CPU reads what the GPU wrote. Coherent imports (desktop GPUs): nothing changes.
+// EOWRECOMP_VK_CACHE_CLEAN=0 / 1: off / on whatever the memory type.
+static void heap_note_type(uint32_t type) {  // (each heap import: the memory type it took)
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    int nc = type < mp.memoryTypeCount && !(mp.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    const char *e = getenv("EOWRECOMP_VK_CACHE_CLEAN");
+    if (e) nc = atoi(e) != 0;
+    if (heap_cc != nc)
+        LOG("[vk] guest heap import: memory type %u (flags %#x), %s%s\n", type, type < mp.memoryTypeCount ? mp.memoryTypes[type].propertyFlags : 0,
+            nc ? "not coherent: CPU caches written back / invalidated around the GPU's use" : "coherent", e ? " (EOWRECOMP_VK_CACHE_CLEAN)" : "");
+    heap_cc = nc;
+}
+static bool heap_noncoherent(void) { return heap_cc > 0; }
+
+// The ranges the pending submission reads (heap_clean), written back at its submission (heap_clean_flush)
+#define CC_MAX 8192
+static struct { uint64_t lo, hi; } cc_list[CC_MAX];
+static int cc_n;
+static struct { uint64_t addr, size, seq; } cc_seen[4096];  // (repeats within one submission: once)
+static void heap_clean_flush(void);
+static uint64_t gmem_size;  // (the import's size: below)
+static void heap_clean(uint64_t addr, uint64_t size) {  // (before the GPU reads [addr, addr+size) of the heap)
+    if (heap_cc <= 0 || !size || addr < HEAP_BASE || addr - HEAP_BASE >= gmem_size) return;  // (only the import: mapped)
+    if (addr - HEAP_BASE + size > gmem_size) size = gmem_size - (addr - HEAP_BASE);
+    uint64_t seq = vk_pending_seq(), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
+    uint32_t slot = (uint32_t)(h ^ (h >> 32)) & 4095;
+    if (cc_seen[slot].seq == seq && cc_seen[slot].addr == addr && cc_seen[slot].size == size) return;
+    cc_seen[slot].addr = addr; cc_seen[slot].size = size; cc_seen[slot].seq = seq;
+    if (cc_n == CC_MAX) heap_clean_flush();  // (full: the ones so far now, recorded work isn't submitted yet anyway)
+    cc_list[cc_n].lo = addr; cc_list[cc_n].hi = addr + size; cc_n++;
+}
+static int cc_cmp(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+static void heap_clean_flush(void) {
+    if (!cc_n) return;
+    qsort(cc_list, (size_t)cc_n, sizeof cc_list[0], cc_cmp);
+    uint64_t lo = cc_list[0].lo, hi = cc_list[0].hi;
+    for (int i = 1; i <= cc_n; i++) {  // (overlapping / touching ranges: one walk)
+        if (i < cc_n && cc_list[i].lo <= hi + 64) { if (cc_list[i].hi > hi) hi = cc_list[i].hi; continue; }
+        plat_cache_op(lo, hi - lo, false);
+        stat_clean_bytes += hi - lo;
+        if (i < cc_n) lo = cc_list[i].lo, hi = cc_list[i].hi;
+    }
+    cc_n = 0;
+}
+
+// (non-coherent heap) the ranges a storing shader has bound: written back and invalidated when it is recorded and again
+// once its submission is done
+#define GW_INV_MAX 8192
+static struct { uint64_t lo, hi, seq; } gw_inv[GW_INV_MAX];
+static int ngw_inv;
+static pthread_mutex_t gw_inv_lock = PTHREAD_MUTEX_INITIALIZER;
+static void gw_inval_add(uint64_t a, uint64_t sz) {
+    plat_cache_op(a, sz, true);
+    pthread_mutex_lock(&gw_inv_lock);
+    for (int i = ngw_inv - 1; i >= 0 && i >= ngw_inv - 16; i--)  // (the same range again in this submission: once)
+        if (gw_inv[i].lo == a && gw_inv[i].hi == a + sz && gw_inv[i].seq == vk_pending_seq()) { pthread_mutex_unlock(&gw_inv_lock); return; }
+    // (full - not expected: this range only gets the write-back above)
+    if (ngw_inv < GW_INV_MAX) gw_inv[ngw_inv].lo = a, gw_inv[ngw_inv].hi = a + sz, gw_inv[ngw_inv].seq = vk_pending_seq(), ngw_inv++;
+    pthread_mutex_unlock(&gw_inv_lock);
+}
+static void gw_inval_done(uint64_t done) {
+    if (!ngw_inv) return;
+    pthread_mutex_lock(&gw_inv_lock);
+    int o = 0;
+    for (int i = 0; i < ngw_inv; i++) {
+        if (gw_inv[i].seq <= done) { plat_cache_op(gw_inv[i].lo, gw_inv[i].hi - gw_inv[i].lo, true); stat_inval_bytes += gw_inv[i].hi - gw_inv[i].lo; }
+        else gw_inv[o++] = gw_inv[i];
+    }
+    ngw_inv = o;
+    pthread_mutex_unlock(&gw_inv_lock);
+}
+
 // Global memory (shader LDG/STG, maxwell_gmem_base = HEAP_BASE): the guest heap imported as a GPU buffer
 // (VK_EXT_external_memory_host), zero-copy like metal.m's g_guest_buffer, so compute results land in guest
 // memory. The import pins its pages, so it covers only the heap the game set up (SetHeapSize), made on first use.
@@ -2064,6 +2164,7 @@ static bool gmem_import(uint64_t size) {
                                .memoryTypeIndex = (uint32_t)__builtin_ctz(mp.memoryTypeBits)};
     VkDeviceMemory mem;
     if (vkAllocateMemory(g_vk.dev, &ai, NULL, &mem) != VK_SUCCESS) return false;
+    heap_note_type(ai.memoryTypeIndex);
     VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size,
@@ -2201,6 +2302,7 @@ static void gfast_prepare(VkCommandBuffer cb) {
             LOG("\n");
         }
     }
+    for (int i = 0; i < m; i++) heap_clean(HEAP_BASE + cp[i].srcOffset, cp[i].size);  // (non-coherent heap)
     vkCmdCopyBuffer(cb, gmem_buf, gfast_buf, (uint32_t)m, cp);
     vk_full_barrier(cb);
     gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
@@ -2316,6 +2418,7 @@ static void vc_mark_sbufs(int stage) {
     for (int i = 0; i < 16; i++) {
         uint64_t a = st.sbuf[stage][i].addr, sz = st.sbuf[stage][i].size;
         if (a >= HEAP_BASE && sz && a - HEAP_BASE < HEAP_MAX) vc_mark_gpu(a - HEAP_BASE, a - HEAP_BASE + sz);
+        if (a >= HEAP_BASE && sz && a - HEAP_BASE < HEAP_MAX && heap_noncoherent()) gw_inval_add(a, sz);
     }
 }
 
@@ -2419,6 +2522,7 @@ void vc_flush(void) {
             cp[nc++] = (VkBufferCopy){o, o - e->lo, VC_PAGE};
         }
         if (nc) {
+            for (int k = 0; k < nc; k++) heap_clean(HEAP_BASE + cp[k].srcOffset, cp[k].size);  // (non-coherent heap)
             vkCmdCopyBuffer(cb, gmem_buf, e->buf, (uint32_t)nc, cp);
             for (int k = 0; k < nc; k++) prof_vc_copied += cp[k].size;
         }
@@ -2438,6 +2542,7 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
     if (vcache_lookup(addr, size, buf, off)) return true;
+    heap_clean(addr, size);  // (read in place: non-coherent heap)
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
     return true;
@@ -2686,6 +2791,8 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         LOG("\n");
     }
     if (cp->si->uses_gmem_map) gfast_prepare(cb);
+    if (cp->si->uses_gmem && heap_noncoherent())  // (the storage ranges it reads in the heap)
+        for (int i = 0; i < 16; i++) heap_clean(st.sbuf[5][i].addr, st.sbuf[5][i].size);
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
@@ -2981,6 +3088,10 @@ static void draw_(CmdRec *r, bool indexed) {
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);  // (always new sets)
     if (pr->vi->uses_gmem_store) vc_mark_sbufs(0);
     if (pr->fi->uses_gmem_store) vc_mark_sbufs(1);
+    if (heap_noncoherent())  // (the storage ranges its stages read in the heap)
+        for (int sg = 0; sg < 2; sg++)
+            if ((sg ? pr->fi : pr->vi)->uses_gmem)
+                for (int i = 0; i < 16; i++) heap_clean(st.sbuf[sg][i].addr, st.sbuf[sg][i].size);
 
     uint64_t prof_t2_ = prof ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)
