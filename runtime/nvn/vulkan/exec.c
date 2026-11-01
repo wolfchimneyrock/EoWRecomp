@@ -102,6 +102,7 @@ static void wait_account(uint64_t ns) {
 static void cq_resolve_done(uint64_t done);
 static void gw_inval_done(uint64_t done);  // (the GPU's writes into a non-coherent heap import: with the gmem import below)
 static void heap_clean_flush(void);
+static void readback_waited(uint64_t seq);  // (the readback buffer, invalidated once its copy is waited for)
 
 // The timeline semaphore (g_vk.timeline) signalled by every submission, or only the completion marker (seq_buf):
 // Turnip on kgsl emulates timelines, and each vkQueueSubmit signalling one first waited on the CPU for the earlier
@@ -148,6 +149,7 @@ void vk_wait_seq(uint64_t seq) {
     else if (r == VK_SUCCESS) {
         seq_note_done(seq), cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
         gw_inval_done(seq);    // (non-coherent heap: the GPU's writes the CPU may read now)
+        readback_waited(seq);
     }
     else {
         extern void vk_devlost_dump(void);
@@ -621,22 +623,30 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
 
 // GPU -> CPU copies: the ring is write-combined (often device-local over the BAR), where CPU reads crawl (a
 // 1280x720 screenshot took 7 s). Readbacks use one host-cached buffer instead. Every user waits for the GPU and
-// reads the data before the next readback (render thread), so a single grow-only buffer suffices.
+// reads the data before the next readback (render thread), so a single grow-only buffer suffices. Host-cached memory
+// need not be coherent (Mali-G610: memory type 1, HOST_CACHED without HOST_COHERENT), and the buffer is reused: the
+// CPU could read its caches' lines of the previous readback. The wait that covers the copy (vk_wait_seq) invalidates
+// the allocation (vmaInvalidateAllocation: nothing on coherent memory).
+static VmaAllocation rb_mem;
+static uint64_t rb_seq;  // the submission that holds the last readback copy (0: none waiting)
+static void readback_waited(uint64_t seq) {
+    if (rb_seq && seq >= rb_seq) { vmaInvalidateAllocation(g_vk.vma, rb_mem, 0, VK_WHOLE_SIZE); rb_seq = 0; }
+}
 VkSpan vk_readback(uint64_t size) {
     static VkBuffer buf;
-    static VmaAllocation mem;
     static uint8_t *ptr;
     static uint64_t cap;
     if (size > cap) {
-        if (buf) { vk_wait_seq(submit_seq); vmaDestroyBuffer(g_vk.vma, buf, mem); }
+        if (buf) { vk_wait_seq(submit_seq); vmaDestroyBuffer(g_vk.vma, buf, rb_mem); }
         cap = (size + (16 << 20) - 1) & ~((16ull << 20) - 1);
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = cap, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST, .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                       .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
         VmaAllocationInfo info;
-        VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &buf, &mem, &info));
+        VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &buf, &rb_mem, &info));
         ptr = info.pMappedData;
     }
+    rb_seq = vk_pending_seq();
     return (VkSpan){buf, 0, ptr};
 }
 
