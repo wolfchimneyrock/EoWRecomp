@@ -3476,9 +3476,10 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
 static VkPipelineLayout present_layout;
 static VkDescriptorSetLayout present_set_layout;
 
-static VkPipeline present_pipeline(VkFormat fmt) {
-    static struct { VkFormat f; VkPipeline p; } cache[4];
-    for (int i = 0; i < 4; i++) if (cache[i].p && cache[i].f == fmt) return cache[i].p;
+// rcas: present_rcas.frag (FSR 1's sharpen folded into the present: post_process)
+static VkPipeline present_pipeline_ex(VkFormat fmt, bool rcas) {
+    static struct { VkFormat f; bool r; VkPipeline p; } cache[8];
+    for (int i = 0; i < 8; i++) if (cache[i].p && cache[i].f == fmt && cache[i].r == rcas) return cache[i].p;
     if (!present_layout) {
         VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
@@ -3492,7 +3493,7 @@ static VkPipeline present_pipeline(VkFormat fmt) {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
          .module = vk_builtin_shader("present.vert"), .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-         .module = vk_builtin_shader("present.frag"), .pName = "main"}};
+         .module = vk_builtin_shader(rcas ? "present_rcas.frag" : "present.frag"), .pName = "main"}};
     VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
@@ -3515,9 +3516,10 @@ static VkPipeline present_pipeline(VkFormat fmt) {
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = present_layout};
     VkPipeline p;
     VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
-    for (int i = 0; i < 4; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].p = p; break; }
+    for (int i = 0; i < 8; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].r = rcas; cache[i].p = p; break; }
     return p;
 }
+static VkPipeline present_pipeline(VkFormat fmt) { return present_pipeline_ex(fmt, false); }
 
 // Scanout shows the bytes the game wrote: sRGB images are read through a UNORM view (no decode), like metal.m.
 static VkImageView raw_view(TexBackend *b) {
@@ -3671,13 +3673,18 @@ static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *src
 
 // The view the present samples: the game image, or its anti-aliased / upscaled version. ow x oh: the whole image's
 // size in the window (its crop is drawn into the viewport).
-static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d) {
+// rcas_present: the present draws the upscaled image 1:1 (no crop), so FSR's sharpen can run in it (*rcas_done false):
+// one pass and one full-window image less (EOWRECOMP_VK_RCAS_PASS=1: the separate pass anyway).
+static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, double oh_d, bool rcas_present, bool *rcas_done) {
     VkImageView v = raw_view(b);
     bool smaa = g_settings.antialias == AA_SMAA;
     uint32_t ow = (uint32_t)lround(ow_d), oh = (uint32_t)lround(oh_d);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
     bool fsr = g_settings.upscaler == UPSCALE_FSR1 && (ow > b->width + 1 || oh > b->height + 1);  // (an upscale only)
+    static int rcas_pass = -1;
+    if (rcas_pass < 0) rcas_pass = getenv("EOWRECOMP_VK_RCAS_PASS") && atoi(getenv("EOWRECOMP_VK_RCAS_PASS"));
+    *rcas_done = !(fsr && rcas_present && !rcas_pass);
     if (!smaa && !fsr) return v;
     extern void vk_frame_suspend(void);
     extern void vk_frame_resume(void);
@@ -3697,12 +3704,16 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     }
     if (fsr) {
         float iw = (float)b->width, ih = (float)b->height;
-        TexBackend *e = post_image(3, ow, oh), *r = post_image(4, ow, oh);
+        TexBackend *e = post_image(3, ow, oh);
         float pe[8] = {iw / ow, ih / oh, 0.5f * iw / ow - 0.5f, 0.5f * ih / oh - 0.5f, iw, ih};
         VkImageView ei[3] = {v};
         post_pass(cb, "easu.frag", ei, 1, e, pe, false);
+        v = post_view(e);
+    }
+    if (fsr && *rcas_done) {
+        TexBackend *r = post_image(4, ow, oh);
         float pr[8] = {exp2f(-0.2f), 0, 0, 0, (float)ow, (float)oh};  // (sharpness 0.2 stops: AMD's default)
-        VkImageView ri_[3] = {post_view(e)};
+        VkImageView ri_[3] = {v};
         post_pass(cb, "rcas.frag", ri_, 1, r, pr, false);
         v = post_view(r);
     }
@@ -3721,8 +3732,10 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
 void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
-    VkImageView src = post_process(cb, b, pv[6] > 0 ? vw / pv[6] : vw, pv[7] > 0 ? vh / pv[7] : vh);
-    VkPipeline p = present_pipeline(g_vk.sc_format);
+    bool rcas_done = true;
+    bool whole = pv[4] == 0 && pv[5] == 0 && pv[6] == 1 && pv[7] == 1;  // (no crop: the upscaled image lands 1:1)
+    VkImageView src = post_process(cb, b, pv[6] > 0 ? vw / pv[6] : vw, pv[7] > 0 ? vh / pv[7] : vh, whole, &rcas_done);
+    VkPipeline p = present_pipeline_ex(g_vk.sc_format, !rcas_done);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
     VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
