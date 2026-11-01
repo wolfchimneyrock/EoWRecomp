@@ -483,7 +483,8 @@ class Module:
 from patches import PATCHES
 
 
-def adr_feeds_br(m, i, rd, window=6):
+def adr_feeds_br(m, i, rd, window=32):  # (6 missed main 0x7001a657e0: 4 movs scheduled before its br -> crash after Ganon;
+    # 12 still missed main 0x7001810120 (br within 24), subsdk0 0x7008540b14 (16), subsdk1 0x700a0513a8 (24))
     """ADR whose register reaches a `br` within a few instructions: the base of a compact jump table's cases
     (LLVM: adr xB, cases ; ldrb/ldrh wO, [table, idx] ; add xB, xB, xO, lsl #2 ; br xB), code inside the same
     function - not a callback. Treating it as a function start split the function at its cases, so its table
