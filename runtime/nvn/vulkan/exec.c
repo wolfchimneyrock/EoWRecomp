@@ -626,6 +626,7 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
 static void *worker(void *a) {
     (void)a;
+    plat_thread_default_core();  // (all cores: started from a game thread held to the big ones)
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -667,6 +668,7 @@ static void job_end(void) {
 void vk_pipeline_cache_save(void);  // device.c
 static void *job_watchdog(void *a) {
     (void)a;
+    plat_thread_default_core();  // (all cores: started from a game thread held to the big ones)
     uint64_t saved = 0;
     for (int tick = 1;; tick++) {
         SDL_Delay(5000);
@@ -700,6 +702,7 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+    plat_thread_default_core();  // (all cores: started from a game thread held to the big ones)
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);

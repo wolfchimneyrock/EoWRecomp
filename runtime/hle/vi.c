@@ -15,6 +15,7 @@ static void *vsync_thread(void *arg) {
     (void)arg;
     const uint64_t period = 16666667;
     plat_thread_realtime(period);
+    plat_thread_core(PLAT_CORE_VSYNC);  // (Linux big.LITTLE: on the big cores)
     uint64_t next = plat_now_ns();
     for (;;) {
         next += period;

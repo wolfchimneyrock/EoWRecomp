@@ -56,8 +56,17 @@ void plat_thread_realtime(uint64_t period_ns);  // periodic timing thread (vsync
 void plat_thread_name(const char *name);       // the calling thread's name in profilers / top (15 chars at most)
 // Where the calling thread should run (phones: the game's main thread and the render thread on the big cores); a
 // no-op elsewhere
-enum { PLAT_CORE_MAIN, PLAT_CORE_RENDER, PLAT_CORE_OTHER };
+// Linux on a big.LITTLE / hybrid CPU: the game's threads (MAIN, RENDER, OTHER = any guest thread) and the vsync thread on
+// the big cores (platform/linux.c)
+enum { PLAT_CORE_MAIN, PLAT_CORE_RENDER, PLAT_CORE_OTHER, PLAT_CORE_VSYNC };
 void plat_thread_core(int role);
+// The calling thread on all of the process's cores again (Linux: a thread inherits its creator's affinity, so the shader
+// workers started by a game thread would stay on the big cores too). Elsewhere a no-op.
+#if defined(__linux__) && !defined(__ANDROID__)
+void plat_thread_default_core(void);
+#else
+static inline void plat_thread_default_core(void) {}
+#endif
 // Frame work report (phones: Android's performance hints, so the fast cores and clocks come when the game needs
 // them): the game thread's busy time of the frame against the frame's target; a no-op elsewhere
 void plat_frame_work(uint64_t busy_ns, uint64_t target_ns);
