@@ -204,6 +204,11 @@ int main(int argc, char **argv) {
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+    {   // menu "Freeze log" (default on): the log goes to eowrecomp.log even with a console window
+        extern void settings_load(void);
+        settings_load();
+        if (g_settings.freeze_log) plat_log_to_file();
+    }
 #ifdef __ANDROID__
     android_env_file();
     if (!g_guest_reserved && !plat_reserve_guest(GUEST_LO, GUEST_HI)) {

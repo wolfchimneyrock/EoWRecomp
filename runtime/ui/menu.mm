@@ -488,6 +488,12 @@ static void tab_display(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
 
+    opt_section("Troubleshooting");
+    if (opt_toggle("Freeze log", &g_settings.freeze_log, true,
+                   "Writes eowrecomp.log next to the game, and if the game stops moving for 10 seconds, adds a report "
+                   "of what every part of the game was doing. After a freeze or crash, the log of that run is kept "
+                   "as eowrecomp-previous.log when you start again."))
+        if (g_settings.freeze_log) plat_log_to_file();
     opt_end();
 }
 

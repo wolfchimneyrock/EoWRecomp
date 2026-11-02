@@ -30,7 +30,8 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
-    bool dpad_move;      // the d-pad (and arrow keys) also act as the left stick
+    bool freeze_log;     // eowrecomp.log next to the exe + a report of every game thread when the game stops (kernel.c)
+    bool dpad_move;     // the d-pad (and arrow keys) also act as the left stick
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
     int prompts;         // PROMPTS_*: button glyphs (auto = follow the controller SDL reports): runtime/nvn/texpatch.c
     bool aspect_asked;   // the start screen's one-time "authentic 16:9 or unlocked?" question was answered
