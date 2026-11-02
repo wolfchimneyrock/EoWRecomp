@@ -410,9 +410,11 @@ static VkQueryPool gp_qp;
 static int gp_n;
 static char gp_label[512][112];
 static uint32_t gp_draws[512];
-// EOWRECOMP_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with EOWRECOMP_SYNC_SUBMIT=1 the
-// dump ends with the command list that faulted).
-static char dl_ring[64][128];
+// EOWRECOMP_VK_DEVLOST_TRACE=1: the last 256 GPU operations, dumped on device loss (with EOWRECOMP_SYNC_SUBMIT=1 the
+// dump ends with the command list that faulted). =2: each pass / copy its own submission, waited on (the dump ends
+// with the pass that faulted); =3: as 2, with each draw's shaders (code addresses, fragment hash) - which draw of the
+// pass hung the GPU.
+static char dl_ring[256][128];
 static unsigned dl_n;
 static int dl_on = -1;
 static void dl_note(const char *fmt, ...) {
@@ -420,14 +422,14 @@ static void dl_note(const char *fmt, ...) {
     if (!dl_on) return;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(dl_ring[dl_n++ & 63], sizeof dl_ring[0], fmt, ap);
+    vsnprintf(dl_ring[dl_n++ & 255], sizeof dl_ring[0], fmt, ap);
     va_end(ap);
 }
 void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv) { dl_note("  upload %p %ux%u lv%u", img, w, h, lv); }
 void vk_devlost_dump(void) {
     if (!dl_on) return;
     LOG("[vk] last GPU operations before the device loss (oldest first):\n");
-    for (unsigned i = dl_n > 64 ? dl_n - 64 : 0; i < dl_n; i++) LOG("[vk]   %s\n", dl_ring[i & 63]);
+    for (unsigned i = dl_n > 256 ? dl_n - 256 : 0; i < dl_n; i++) LOG("[vk]   %s\n", dl_ring[i & 255]);
 }
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
     if (!g_gpuprof_frame || gp_n >= 511) return;
@@ -1121,7 +1123,7 @@ static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v :
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
-    if (dl_on == 2) renderer_flush();  // (EOWRECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
+    if (dl_on >= 2) renderer_flush();  // (EOWRECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     st.rt_dirty = false;
     VkCommandBuffer cb = vk_cmd();
     vk_barrier_ex(cb, true);  // passes, copies and dispatches see each other's results
@@ -3414,6 +3416,9 @@ static void draw_(CmdRec *r, bool indexed) {
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);  // (always new sets)
     if (pr->vi->uses_gmem_store) vc_mark_sbufs(0);
     if (pr->fi->uses_gmem_store) vc_mark_sbufs(1);
+    if (dl_on >= 3)
+        dl_note("  draw vs %llx fs %llx fshash %016llx count %u", (unsigned long long)st.program->stages[0].code_addr,
+                (unsigned long long)st.program->stages[1].code_addr, (unsigned long long)g_cur_fs_hash, (uint32_t)r->x[2]);
     if (heap_noncoherent())  // (the storage ranges its stages read in the heap)
         for (int sg = 0; sg < 2; sg++)
             if ((sg ? pr->fi : pr->vi)->uses_gmem)
@@ -3700,7 +3705,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
     vk_end_pass();
-    if (dl_on == 2) renderer_flush();  // (EOWRECOMP_VK_DEVLOST_TRACE=2: each copy its own submission, waited on)
+    if (dl_on >= 2) renderer_flush();  // (EOWRECOMP_VK_DEVLOST_TRACE=2: each copy its own submission, waited on)
     gp_mark(vk_cmd(), "copy texture %ux%u -> %ux%u", st_->width, st_->height, dt->width, dt->height);
     dl_note("copy texture %ux%u f%#x -> %ux%u f%#x (%p -> %p)", st_->width, st_->height, st_->format, dt->width, dt->height,
             dt->format, (void *)st_, (void *)dt);
