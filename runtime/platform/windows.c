@@ -128,8 +128,10 @@ void plat_thread_realtime(uint64_t period_ns) {
 // (the start screen re-executing itself for the game) append to the same log.
 static char g_log_path[MAX_PATH];
 
-static void log_to_file_without_console(void) {
-    if (GetStdHandle(STD_ERROR_HANDLE) && GetStdHandle(STD_ERROR_HANDLE) != INVALID_HANDLE_VALUE) return;  // console / pipe
+// The first process of a run keeps the last run's log as eowrecomp-previous.log (after a freeze the player closes the
+// game and starts it again: the freeze report must survive that).
+void plat_log_to_file(void) {
+    if (g_log_path[0]) return;
     char exe[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
     if (!n || n >= sizeof exe) return;
@@ -137,10 +139,20 @@ static void log_to_file_without_console(void) {
     if (slash) slash[1] = 0;
     snprintf(g_log_path, sizeof g_log_path, "%seowrecomp.log", exe);
     bool append = getenv("EOWRECOMP_LOG_APPEND") != NULL;
+    if (!append) {
+        char prev[MAX_PATH + 32];
+        snprintf(prev, sizeof prev, "%seowrecomp-previous.log", exe);
+        MoveFileExA(g_log_path, prev, MOVEFILE_REPLACE_EXISTING);
+    }
     if (!freopen(g_log_path, append ? "ab" : "wb", stderr)) { g_log_path[0] = 0; return; }
     setvbuf(stderr, NULL, _IONBF, 0);
     _dup2(_fileno(stderr), _fileno(stdout));
     _putenv("EOWRECOMP_LOG_APPEND=1");
+}
+
+static void log_to_file_without_console(void) {
+    if (GetStdHandle(STD_ERROR_HANDLE) && GetStdHandle(STD_ERROR_HANDLE) != INVALID_HANDLE_VALUE) return;  // console / pipe
+    plat_log_to_file();
 }
 
 // The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing
@@ -279,6 +291,47 @@ void plat_print_backtrace(void) {
         if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, s, (unsigned long long)off);
         else fprintf(stderr, "  #%-2d %016llx eowrecomp+%llx\n", i, (unsigned long long)pc,
                      (unsigned long long)(pc - exe));
+    }
+}
+
+// Another thread's stack: suspend it, unwind from its context with the x64 unwind tables (.pdata: the exe, the game
+// DLL and system DLLs all have them), resume, then print (nothing that could wait on a lock it holds runs while it's
+// suspended).
+void plat_thread_backtrace(pthread_t thread) {
+    HANDLE h = pthread_gethandle(thread);
+    if (!h) return;
+    if (GetThreadId(h) == GetCurrentThreadId()) { plat_print_backtrace(); return; }
+    uint64_t pcs[40];
+    int n = 0;
+    if (SuspendThread(h) == (DWORD)-1) return;
+    CONTEXT ctx = {.ContextFlags = CONTEXT_FULL};
+    if (GetThreadContext(h, &ctx)) {
+        while (n < 40 && ctx.Rip) {
+            pcs[n++] = ctx.Rip;
+            DWORD64 base = 0;
+            PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+            if (fe) {
+                void *hd;
+                DWORD64 ef;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fe, &ctx, &hd, &ef, NULL);
+            } else {  // a leaf function: the return address is on top of the stack
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery((void *)(uintptr_t)ctx.Rsp, &mi, sizeof mi) || mi.State != MEM_COMMIT) break;
+                ctx.Rip = *(DWORD64 *)(uintptr_t)ctx.Rsp;
+                ctx.Rsp += 8;
+            }
+        }
+    }
+    ResumeThread(h);
+    uint64_t exe = (uint64_t)(uintptr_t)GetModuleHandleA(NULL);
+    for (int i = 0; i < n; i++) {
+        uint64_t off = 0;
+        const char *s = rt_host_fn_name(pcs[i], &off);  // (game functions first: they live in eowgame.dll)
+        if (!s) s = plat_symbol(pcs[i], &off);
+        if (s) fprintf(stderr, "[freeze]   host #%-2d %016llx %s+%llx\n", i, (unsigned long long)pcs[i], s,
+                       (unsigned long long)off);
+        else fprintf(stderr, "[freeze]   host #%-2d %016llx eowrecomp+%llx\n", i, (unsigned long long)pcs[i],
+                     (unsigned long long)(pcs[i] - exe));
     }
 }
 

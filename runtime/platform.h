@@ -1,6 +1,7 @@
 // Host OS layer: everything the runtime needs that differs between macOS and Windows.
 // Implementations: runtime/platform/macos.c, runtime/platform/windows.c (the Makefile picks one).
 #pragma once
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -106,6 +107,11 @@ bool plat_remove_tree(const char *dir);      // rm -rf
 // Name of the host function containing pc (guest functions are f_<addr>), NULL if unknown.
 const char *plat_symbol(uint64_t pc, uint64_t *offset);
 void plat_print_backtrace(void);
+// Freeze report (runtime/kernel.c): another thread's host stack, printed like plat_print_backtrace (Windows; a no-op elsewhere)
+void plat_thread_backtrace(pthread_t thread);
+// Menu "Freeze log": stdout / stderr into eowrecomp.log next to the exe, also when there is a console (Windows; the
+// previous run's log becomes eowrecomp-previous.log). A no-op elsewhere / when already logging to the file.
+void plat_log_to_file(void);
 void plat_fatal_notice(void);  // a fatal error is about to end the process: tell the user (Windows release: message box)
 void plat_crash_handler_install(void);  // per thread where the OS needs it (alternate signal stack)
 // Called by the crash handler (runtime/dispatch.c): true = fault handled (watchpoint), resume.

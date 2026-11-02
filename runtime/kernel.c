@@ -6,6 +6,7 @@
 
 #include "hle.h"
 #include "kernel.h"
+#include "settings.h"
 
 // ------------------------------------------------------------------ results
 #undef R_OK
@@ -351,12 +352,17 @@ static uint32_t svc_arbitrate_unlock(uint64_t addr) {
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
     pthread_mutex_lock(&g_klock);
     KThread *t = t_cur;
+    // The key's "has waiters" word goes up BEFORE the mutex is let go, as Horizon does (Atmosphere
+    // KConditionVariable::Wait writes the key, then the mutex word). nn::os Signal/Broadcast read the key in user space
+    // and skip svcSignalProcessWideKey when it is 0: with the old order another thread could take the just-released
+    // mutex, make the condition true, see key 0 and not signal - this thread then slept forever (Echoes of Wisdom
+    // froze in a Hyrule Castle Town cutscene: the main thread in std::future::wait with the future already ready).
+    __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
     mutex_release(mutex);
     t->wait_kind = WAIT_CONDVAR;
     t->wait_addr = key;
     t->wait_mutex = mutex;
     t->wait_tag = tag;
-    __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
     uint32_t r = block_current(timeout);
     // Timed out / cancelled: the mutex is NOT held - as on Horizon (Atmosphere KConditionVariable::Wait; libnx
     // condvarWaitTimeout: "On timeout, we need to acquire it manually"). The SDK takes it again itself
@@ -849,6 +855,81 @@ void kernel_reset(void) {
     pthread_mutex_unlock(&g_klock);
 }
 
+// ------------------------------------------------------------------ freeze detector
+// Menu -> Display -> "Freeze log" (g_settings.freeze_log): when the game shows no new frame for 10 s (menu closed), the
+// log gets a report of every guest thread - where it is (guest pc / lr and the guest call chain from the frame
+// pointers, plus the host stack: recompiled functions show as f_<guest addr>) and what it waits on. Again at 40 s,
+// then quiet until frames come back. eowrecomp.log (the previous run's: eowrecomp-previous.log) has it.
+volatile uint64_t g_game_presents;  // nvnQueuePresentTexture calls (runtime/nvn/objects.c)
+bool menu_is_open(void);            // runtime/ui/menu.mm
+
+static const char *freeze_sym(uint64_t a, char *buf, size_t n) {
+    uint64_t off = 0;
+    const char *s = a ? loader_symbol_at(a, &off) : NULL;
+    if (s) snprintf(buf, n, "%s+%llx", s, (unsigned long long)off);
+    else snprintf(buf, n, "?");
+    return buf;
+}
+
+static void dump_thread(KThread *t) {
+    static const char *const waits[] = {"none", "mutex", "condvar", "arbiter"};
+    Cpu *c = &t->cpu;
+    char s1[160], s2[160];
+    LOG("[freeze] thread %llu (prio %d, core %d, entry %llx): wait %s addr %llx mutex %llx, in WaitSynchronization %d\n",
+        (unsigned long long)t->id, t->prio, t->core, (unsigned long long)t->entry,
+        waits[t->wait_kind <= WAIT_ARBITER ? t->wait_kind : 0], (unsigned long long)t->wait_addr,
+        (unsigned long long)t->wait_mutex, t->in_sync_wait);
+    LOG("[freeze]   pc %llx (%s)  lr %llx (%s)  sp %llx\n", (unsigned long long)c->pc, freeze_sym(c->pc, s1, sizeof s1),
+        (unsigned long long)c->x[30], freeze_sym(c->x[30], s2, sizeof s2), (unsigned long long)c->sp);
+    // guest callers: the x29 frame chain, kept inside the stack just above sp (memory there is in use, so readable)
+    uint64_t fp = c->x[29], lo = c->sp, hi = c->sp + (4ull << 20);
+    for (int i = 0; i < 24 && fp >= lo && fp + 16 <= hi && !(fp & 7); i++) {
+        uint64_t next = *(volatile uint64_t *)(uintptr_t)fp, ret = *(volatile uint64_t *)(uintptr_t)(fp + 8);
+        if (!ret) break;
+        LOG("[freeze]   guest #%-2d %llx %s\n", i, (unsigned long long)ret, freeze_sym(ret, s1, sizeof s1));
+        if (next <= fp) break;
+        lo = fp + 16;
+        fp = next;
+    }
+    plat_thread_backtrace(t->host);
+}
+
+static void freeze_report(uint64_t secs) {
+    LOG("\n[freeze] ===== no new game frame for %llu s (game frames so far: %llu) =====\n", (unsigned long long)secs,
+        (unsigned long long)g_game_presents);
+    // (a freeze can be a thread stuck holding the kernel lock: then the states are read without it)
+    bool locked = false;
+    for (int i = 0; i < 100 && !(locked = !pthread_mutex_trylock(&g_klock)); i++) usleep(10000);
+    if (!locked) LOG("[freeze] the kernel lock is held by a thread: reading thread states without it\n");
+    for (KThread *t = g_threads; t; t = t->anext)
+        if (t->started && !t->finished) dump_thread(t);
+    if (locked) pthread_mutex_unlock(&g_klock);
+    LOG("[freeze] ===== end of report =====\n\n");
+}
+
+static void *freeze_watch(void *arg) {
+    (void)arg;
+    plat_thread_name("eow-freezewatch");
+    uint64_t last = g_game_presents, since = plat_now_ns();
+    int reports = 0;
+    for (;;) {
+        usleep(500000);
+        uint64_t now = plat_now_ns(), p = g_game_presents;
+        if (p != last || !p || !g_settings.freeze_log || menu_is_open() || g_rt_unwind) {
+            if (reports && p != last)
+                LOG("[freeze] game frames again after %llu s\n", (unsigned long long)((now - since) / 1000000000ull));
+            last = p, since = now, reports = 0;
+            continue;
+        }
+        uint64_t secs = (now - since) / 1000000000ull;
+        if ((reports == 0 && secs >= 10) || (reports == 1 && secs >= 40)) {
+            reports++;
+            freeze_report(secs);
+        }
+    }
+    return NULL;
+}
+
 void kernel_init(void) {
     // Reserve the heap, alias, stack, and TLS regions.
     region_add(TLS_BASE, TLS_SIZE, 0xC, 3);
@@ -857,6 +938,12 @@ void kernel_init(void) {
         region_add(m->base + m->text_off, m->ro_off - m->text_off, 3, 5);
         region_add(m->base + m->ro_off, m->data_off - m->ro_off, 3, 1);
         region_add(m->base + m->data_off, m->size - m->data_off, 4, 3);
+    }
+    static bool watching;
+    if (!watching) {
+        watching = true;
+        pthread_t w;
+        if (!pthread_create(&w, NULL, freeze_watch, NULL)) pthread_detach(w);
     }
 }
 

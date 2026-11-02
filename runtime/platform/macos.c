@@ -174,3 +174,7 @@ void plat_thread_core(int role) { (void)role; }
 void plat_children_elsewhere(bool begin) { (void)begin; }
 void plat_frame_work(uint64_t busy_ns, uint64_t target_ns) { (void)busy_ns, (void)target_ns; }
 void plat_thread_name(const char *name) { pthread_setname_np(name); }
+
+// Freeze report / menu Freeze log: Windows only for now (runtime/platform.h)
+void plat_thread_backtrace(pthread_t thread) { (void)thread; }
+void plat_log_to_file(void) {}

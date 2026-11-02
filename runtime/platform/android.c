@@ -580,3 +580,7 @@ int plat_cpu_count(void) {
 
 // (phones: in the log; the game keeps running)
 void plat_notice(const char *text) { __android_log_print(ANDROID_LOG_WARN, "EoWRecomp", "[notice] %s", text); }
+
+// Freeze report / menu Freeze log: Windows only for now (runtime/platform.h)
+void plat_thread_backtrace(pthread_t thread) { (void)thread; }
+void plat_log_to_file(void) {}

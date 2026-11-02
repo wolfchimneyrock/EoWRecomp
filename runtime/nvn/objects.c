@@ -694,6 +694,13 @@ NVN(nvnQueuePresentTexture) {
     int i = (int)A(2);
     static int first = 1;  // (milestone marker: the game got as far as showing a frame)
     if (first) { first = 0; LOG("[nvn] first nvnQueuePresentTexture (window %llx, texture %d of %d)\n", A(1), i, w->num); }
+    extern volatile uint64_t g_game_presents;  // (runtime/kernel.c: the freeze detector's heartbeat)
+    g_game_presents++;
+    {   // EOWRECOMP_FREEZE_TEST=<frame>: the game thread stops for 15 s once at that frame (tests the freeze report)
+        static long at = -1;
+        if (at < 0) at = getenv("EOWRECOMP_FREEZE_TEST") ? atol(getenv("EOWRECOMP_FREEZE_TEST")) : 0;
+        if (at > 0 && g_game_presents == (uint64_t)at) { LOG("[freeze-test] stopping 15 s\n"); usleep(15000000); }
+    }
     if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
     // NVN shows at most one image per `interval` vsyncs: a game presenting faster waits here, as on the console (the
     // title screen's movie loop presented ~320 times a second on an Adreno 740, the GPU busy for nothing). Only with
