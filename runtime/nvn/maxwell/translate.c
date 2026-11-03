@@ -33,6 +33,11 @@ const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
 const uint8_t *maxwell_dbg_vs;
+// The program's compiler constants (bound as c1), set by the caller before maxwell_translate on the same thread
+// (NULL: unknown). BRX jump tables live there: reading them gives the real targets instead of "any instruction".
+static _Thread_local const uint8_t *maxwell_cb1;
+static _Thread_local uint32_t maxwell_cb1_size;
+void maxwell_set_cb1(const uint8_t *data, uint32_t size) { maxwell_cb1 = size ? data : NULL; maxwell_cb1_size = size; }
 
 #define RZ 255
 #define LMEM_WORDS 256  // local memory per invocation (1 KB)
@@ -197,6 +202,21 @@ static void set_reg(Ctx *c, int r, const char *expr) {
     if (r == RZ) return;
     c->reg_used[r] = 1;
     sp(&c->body, "    r%d = %s;\n", r, expr);
+}
+
+// Video-instruction operand select (VMNMX): bit 3 = signed, 0-3 = byte k, 4-5 = half h, 6-7 = whole word.
+static void video_extend(char *out, const char *x, int sel) {
+    bool s = sel & 8;
+    int k = sel & 7;
+    if (k <= 3) {
+        if (s) sprintf(out, "uint(int(%s << %du) >> 24)", x, 24 - 8 * k);
+        else sprintf(out, "((%s >> %du) & 0xFFu)", x, 8 * k);
+    } else if (k <= 5) {
+        if (s) sprintf(out, "uint(int(%s << %du) >> 16)", x, 16 - 16 * (k - 4));
+        else sprintf(out, "((%s >> %du) & 0xFFFFu)", x, 16 * (k - 4));
+    } else {
+        sprintf(out, "%s", x);
+    }
 }
 
 static const char *fneg_abs(const char *e, bool neg, bool abs_, char *buf) {
@@ -571,8 +591,8 @@ static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, 
 
 // Integer texel coordinates in guest units -> the (possibly larger) allocation of texture slot `slot`.
 static const char *RSC2(Ctx *c, int slot, const char *fmt, ...) {
-    static char bufs[4][1024];
-    static int bi;
+    static _Thread_local char bufs[4][1024];  // per thread: shaders translate on several worker threads at once
+    static _Thread_local int bi;
     char *o = bufs[bi++ & 3];
     char inner[700];
     va_list ap;
@@ -1265,6 +1285,41 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sprintf(t, "((%s) %s %s)", cmp, bool_op((int)bits(w, 45, 2)), P((int)bits(w, 39, 3), bits(w, 42, 1)));
         sprintf(u, bits(w, 44, 1) ? "(%s ? 0x3f800000u : 0u)" : "(%s ? 0xFFFFFFFFu : 0u)", t);
         set_reg(c, d, u);
+    } else if (OPM(0x3a00000000000000ull, 0xfe00000000000000ull)) {
+        // VMNMX (video min/max, field layout as Ryujinx InstVmnmx): m = (mx ? max : min)(A, B), then a second op with C.
+        // Was missing: compute 72a4711000 / 72a4715000 failed to translate and were skipped every frame.
+        int asel = (int)(bits(w, 48, 1) << 3 | bits(w, 36, 3)), bsel = (int)(bits(w, 49, 1) << 3 | bits(w, 28, 3));
+        bool bvid = bits(w, 50, 1), mx = bits(w, 56, 1);
+        int vop = (int)bits(w, 51, 3);
+        char xa[160], xb[160], m[512], r[1200];
+        video_extend(xa, R(a), asel);
+        if (bvid) video_extend(xb, R((int)bits(w, 20, 8)), bsel);
+        else sprintf(xb, "%uu", (unsigned)bits(w, 20, 16));
+        bool as = asel & 8, bs = bsel & 8, rs;
+        const char *mm = mx ? "max" : "min";
+        if (as != bs) {  // mixed signedness: max fits unsigned, min fits signed (as Ryujinx)
+            rs = !mx;
+            if (mx) sprintf(m, "max(%s, %s)", xa, xb);
+            else sprintf(m, "uint(min(int(%s), int(%s)))", xa, xb);
+        } else {
+            rs = as;
+            if (as) sprintf(m, "uint(%s(int(%s), int(%s)))", mm, xa, xb);
+            else sprintf(m, "%s(%s, %s)", mm, xa, xb);
+        }
+        const char *cr = R((int)bits(w, 39, 8));
+        switch (vop) {
+        case 0: sprintf(r, "((%s & 0x0000FFFFu) | (%s << 16u))", cr, m); break;          // MRG_16H
+        case 1: sprintf(r, "((%s & 0xFFFF0000u) | (%s & 0xFFFFu))", cr, m); break;       // MRG_16L
+        case 2: sprintf(r, "((%s & 0xFFFFFF00u) | (%s & 0xFFu))", cr, m); break;         // MRG_8B0
+        case 3: sprintf(r, "((%s & 0xFF00FFFFu) | ((%s & 0xFFu) << 16u))", cr, m); break; // MRG_8B2
+        case 4: sprintf(r, "(%s + %s)", m, cr); break;                                    // ACC
+        case 5: case 6:                                                                    // MIN / MAX
+            if (rs) sprintf(r, "uint(%s(int(%s), int(%s)))", vop == 5 ? "min" : "max", m, cr);
+            else sprintf(r, "%s(%s, %s)", vop == 5 ? "min" : "max", m, cr);
+            break;
+        default: sprintf(r, "%s", m); break;
+        }
+        set_reg(c, d, r);
     } else if (OPM(0x5c20000000000000ull, 0xfff8000000000000ull) || OPM(0x4c20000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3820000000000000ull, 0xfef8000000000000ull)) {  // IMNMX
         bool sgn = bits(w, 48, 1);
@@ -1755,6 +1810,47 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             sp(&c->body, "      if (ok) %s((device atomic_uint *)(gmem + ga), %s, memory_order_relaxed);\n", ms_op[op], R(vr));
         }
         sp(&c->body, "    }\n");
+    } else if (c->glsl && OPM(0xed00000000000000ull, 0xff00000000000000ull)) {  // ATOM: global atomic, Rd = old value
+        // fields per Ryujinx's InstAtom: Rd 0-7, address 8-15 (64-bit pair with .E, bit 48), value 20-27, offset 28-47
+        // (signed), size 49-51 (0 U32, 1 S32), op 52-55 (ADD MIN MAX INC DEC AND OR XOR EXCH). Checked on Echoes of
+        // Wisdom's ed03000000500005: ATOM.E.ADD.S32 R5, [R0], R5 (GPU culling compute 72a4711000 / 72a4715000).
+        int size = (int)bits(w, 49, 3), op = (int)bits(w, 52, 4), vr = (int)bits(w, 20, 8);
+        bool wide = bits(w, 48, 1);
+        int64_t off = sbits(w, 28, 20);
+        if (size > 1) fail(c, "atom size %d", size);
+        if (op > 8) fail(c, "atom op %d", op);
+        bool cas = ((op == 1 || op == 2) && size == 1) || op == 3 || op == 4;
+        static const char *const gl_op[] = {"atomicAdd", "atomicMin", "atomicMax", "", "", "atomicAnd", "atomicOr", "atomicXor",
+                                            "atomicExchange"};
+        static const char *const gl_cas[] = {"", "uint(min(int(o_), int(v_)))", "uint(max(int(o_), int(v_)))",
+                                             "(o_ >= v_ ? 0u : o_ + 1u)", "((o_ == 0u || o_ > v_) ? v_ : o_ - 1u)"};
+        c->info->uses_gmem = true;
+        c->uses_gmem_store = true;
+        c->info->uses_gmem_store = true;
+        char addr[256];
+        if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
+        else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
+        else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+        // (the value is latched first: Rd may be the value register, as in R5 above)
+        sp(&c->body, "    { uint v_ = %s, old_ = 0u; ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul;\n", R(vr), addr,
+           (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
+        const char *fast = "";
+        if (c->stage == STAGE_COMPUTE) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
+            c->info->uses_gmem_map = true;
+            sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
+            fast = "gfast_.w[fw]";
+        }
+        for (int k = fast[0] ? 0 : 1; k < 2; k++) {
+            const char *word = k == 0 ? fast : "gmem_.w[uint(ga >> 2)]";
+            sp(&c->body, k == 0 ? "      if (fw != 0xFFFFFFFFu) " : fast[0] ? "      else if (ok) " : "      if (ok) ");
+            if (cas)
+                sp(&c->body, "{ uint o_ = %s; for (;;) { uint p_ = atomicCompSwap(%s, o_, %s); if (p_ == o_) break; o_ = p_; } old_ = o_; }\n",
+                   word, word, gl_cas[op]);
+            else
+                sp(&c->body, "old_ = %s(%s, v_);\n", gl_op[op], word);
+        }
+        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = old_;\n", d); }
+        sp(&c->body, "    }\n");
     } else if (OPM(0x38f0000000000000ull, 0xfef8000000000000ull) || OPM(0x5cf0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x4cf0000000000000ull, 0xfff8000000000000ull)) {  // R2P
         if (bits(w, 40, 1)) { fail(c, "r2p cc"); }
@@ -1785,8 +1881,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     p2r_done:;
     } else if (OPM(0xe250000000000000ull, 0xfff0000000000020ull)) {  // BRX reg + imm (relative)
         // computed targets can name a scheduling word; execution continues at the next slot (as for BRA)
-        sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; continue; }\n", pc + 8, R(a),
-           (uint32_t)sbits(w, 20, 24));
+        sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; %s }\n", pc + 8, R(a),
+           (uint32_t)sbits(w, 20, 24), c->fwd ? "break;" : "continue;");
     } else if (OPM(0x50a0000000000000ull, 0xfff8000000000000ull)) {  // CSETP (zero/sign flags only)
         int test = (int)bits(w, 8, 5);
         const char *cond;
@@ -2309,6 +2405,9 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     enum { MAX_LOOPS = 64 };
     uint32_t loop_h[MAX_LOOPS], loop_b[MAX_LOOPS];  // head pc, pc of the backward branch
     int nloops = 0;
+    enum { MAX_BRX = 16 };
+    size_t brx_at[MAX_BRX];  // instruction index of each BRX
+    int nbrx = 0;
     for (size_t i = 0; i < end; i++) {
         if (i % 4 == 0) continue;
         uint64_t w = ((const uint64_t *)code)[i];
@@ -2334,16 +2433,77 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
                 }
             }
         }
-        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: any instruction may be a target
+        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: targets resolved after this scan
             any_branch = true;
-            forward = false;
-            memset(label, 1, end);
+            if (nbrx < MAX_BRX) brx_at[nbrx] = i;
+            nbrx++;
         }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
             any_branch = true;
         if ((w & 0xfff0000000000000ull) == 0xe350000000000000ull) forward = false;  // CONT
         (void)is_branch_target_op;
+    }
+    // BRX jump tables. The compiler's pattern: LDC Rt, c[1][Ri + table] right before BRX Rt + imm (Ri bounded by an
+    // IMNMX earlier). Read the table from c1: its entries that land inside the program are the targets. Anything
+    // else (no c1, another writer of Rt, a branch target between the LDC and the BRX) keeps the old behaviour:
+    // every instruction is a possible target, which forces the dispatch loop with ~1300 cases - the shape the
+    // NVIDIA driver took seconds to compile (the new-area stutter). EOWRECOMP_BRX_OLD=1 = always the old way.
+    if (nbrx) {
+        static int brx_old = -1;
+        if (brx_old < 0) brx_old = getenv("EOWRECOMP_BRX_OLD") != NULL;
+        bool ok = !brx_old && maxwell_cb1 && nbrx <= MAX_BRX;
+        size_t ldc_at[MAX_BRX];
+        enum { MAX_BRX_T = 1024 };
+        uint32_t tgt[MAX_BRX_T];
+        int ntgt = 0;
+        for (int b = 0; ok && b < nbrx; b++) {
+            size_t bi = brx_at[b];
+            uint64_t w = ((const uint64_t *)code)[bi];
+            int ra = (int)bits(w, 8, 8);
+            uint32_t pc = (uint32_t)(bi * 8);
+            if (ra == RZ || bits(w, 16, 3) != PT || bits(w, 19, 1)) ok = false;  // (predicated BRX: keep it simple)
+            int64_t off = -1;
+            size_t j = bi;
+            for (int steps = 0; ok && off < 0 && steps < 32; steps++) {
+                if (j == 0) { ok = false; break; }
+                j--;
+                if (j % 4 == 0) continue;
+                uint64_t v = ((const uint64_t *)code)[j];
+                int d = (int)bits(v, 0, 8);
+                if ((v & 0xfff8000000000000ull) == 0xef90000000000000ull && d == ra) {  // LDC
+                    if (bits(v, 36, 5) != 1 || bits(v, 48, 3) == 5 || bits(v, 16, 3) != PT || bits(v, 19, 1)) ok = false;
+                    else off = (int64_t)bits(v, 20, 16);
+                } else if (d <= ra && d + 3 >= ra) ok = false;  // (anything else that may write Rt)
+                else if ((v & 0xfff0000000000000ull) == 0xe250000000000000ull) ok = false;
+            }
+            if (!ok || off < 0) { ok = false; break; }
+            ldc_at[b] = j;
+            int found = 0;
+            for (int64_t k = 0; k < 256 && off + 4 * k + 4 <= (int64_t)maxwell_cb1_size; k++) {
+                int32_t e;
+                memcpy(&e, maxwell_cb1 + off + 4 * k, 4);
+                int64_t t = (int64_t)pc + 8 + e + sbits(w, 20, 24);
+                t &= 0xffffffffll;  // (the shader adds in 32 bits)
+                if (((t >> 3) & 3) == 0) t += 8;
+                if (t < 8 || (t & 7) || (size_t)(t / 8) >= end) break;
+                if (ntgt == MAX_BRX_T) { ok = false; break; }
+                tgt[ntgt++] = (uint32_t)t;
+                found++;
+                if (t <= (int64_t)pc) forward = false;  // (a backward jump: the fwd blocks can't express it)
+            }
+            if (!found) ok = false;
+        }
+        if (ok) {
+            for (int k = 0; k < ntgt; k++) label[tgt[k] / 8] = 1;
+            for (int b = 0; b < nbrx && ok; b++)  // nothing may jump in between the table load and the BRX
+                for (size_t k = ldc_at[b] + 1; k <= brx_at[b]; k++)
+                    if (label[k]) ok = false;
+        }
+        if (!ok) {
+            forward = false;
+            memset(label, 1, end);
+        }
     }
     // translate
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;

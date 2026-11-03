@@ -409,10 +409,37 @@ NVN(nvnCommandBufferDrawElementsBaseVertex) {
     r->x[5] = 0; r->x[6] = 1;
 }
 NVN(nvnCommandBufferDrawElementsInstanced) { trace_draw(c, c->x[3]); Snap s = snap(c); record(c, CMD_DRAW_ELEMENTS, 0, &s); }
-PLAIN(nvnCommandBufferDrawArraysIndirect, CMD_DRAW_ARRAYS_INDIRECT)
-PLAIN(nvnCommandBufferDrawElementsIndirect, CMD_DRAW_ELEMENTS_INDIRECT)
-NVN(nvnCommandBufferMultiDrawArraysIndirectCount) { (void)c; }
-NVN(nvnCommandBufferMultiDrawElementsIndirectCount) { (void)c; }
+// Indirect draws: the counts are read by the GPU from guest memory (often written by a culling compute shader).
+// One record layout for both forms (exec.c draw_indirect):
+//   arrays:   x0 mode, x1 indirect address, x2 count address (0: none), x3 max draws, x4 stride
+//   elements: x0 mode, x1 index type, x2 index address, x3 indirect address, x4 count address, x5 max draws, x6 stride
+static void note_indirect(const char *what) {
+    static int seen[4];
+    int k = what[0] == 'a' ? 0 : what[0] == 'e' ? 1 : what[0] == 'A' ? 2 : 3;
+    if (!seen[k]++) LOG("[nvn] first indirect draw: %s\n", what);
+}
+NVN(nvnCommandBufferDrawArraysIndirect) {  // (cmd, mode, indirect)
+    note_indirect("arrays");
+    Snap s = snap(c);
+    CmdRec *r = record(c, CMD_DRAW_ARRAYS_INDIRECT, 0, &s);
+    r->x[2] = 0; r->x[3] = 1; r->x[4] = 16;
+}
+NVN(nvnCommandBufferDrawElementsIndirect) {  // (cmd, mode, type, index buffer, indirect)
+    note_indirect("elements");
+    Snap s = snap(c);
+    CmdRec *r = record(c, CMD_DRAW_ELEMENTS_INDIRECT, 0, &s);
+    r->x[4] = 0; r->x[5] = 1; r->x[6] = 20;
+}
+NVN(nvnCommandBufferMultiDrawArraysIndirectCount) {  // (cmd, mode, indirect, parameter buffer, max draws, stride)
+    note_indirect("Arrays multi count");
+    Snap s = snap(c);
+    record(c, CMD_DRAW_ARRAYS_INDIRECT, 0, &s);
+}
+NVN(nvnCommandBufferMultiDrawElementsIndirectCount) {  // (cmd, mode, type, index buffer, indirect, parameter buffer, max, stride)
+    note_indirect("Elements multi count");
+    Snap s = snap(c);
+    record(c, CMD_DRAW_ELEMENTS_INDIRECT, 0, &s);
+}
 NVN(nvnCommandBufferDrawTransformFeedback) { (void)c; }
 NVN(nvnCommandBufferDrawTexture) { (void)c; }
 PLAIN(nvnCommandBufferDispatchCompute, CMD_DISPATCH)
