@@ -171,6 +171,7 @@ typedef struct {
     AVPacket *pkt;
     bool have_pkt, eof;
     bool skippable;  // the launch opening (forced on the first launch, no save yet): A / B / + ends it
+    bool wait_key;   // after the skip seek: drop video packets until a keyframe (else the decoder shows garbage)
 } Extractor;
 
 static void ex_close(Extractor *e) {
@@ -224,6 +225,9 @@ static void ex_fill(Extractor *e) {
             int64_t to = e->fmt->duration - 500000;
             if (av_seek_frame(e->fmt, -1, to, AVSEEK_FLAG_BACKWARD) >= 0) {
                 if (e->have_pkt) { av_packet_unref(e->pkt); e->have_pkt = false; }
+                // rd004_Opening.webm has keyframes only at 0, 0.117 and 84.45 s: the seek lands on inter frames,
+                // which decode against the wrong picture (blocky garbage) until the last keyframe.
+                e->wait_key = !getenv("EOWRECOMP_MOVIE_SEEK_OLD");
                 LOG("[movie] opening: still playing -> seek to the end\n");
             }
             e->skippable = false;  // (done: later presses on the title / file select are the menus' own)
@@ -232,7 +236,17 @@ static void ex_fill(Extractor *e) {
     }
     while (!e->have_pkt && !e->eof) {
         if (av_read_frame(e->fmt, e->pkt) < 0) { e->eof = true; break; }
-        if (e->selected & (1ull << e->pkt->stream_index)) e->have_pkt = true;
+        bool sel = (e->selected & (1ull << e->pkt->stream_index)) != 0;
+        if (sel && e->wait_key && e->fmt->streams[e->pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            if (e->pkt->flags & AV_PKT_FLAG_KEY) {
+                e->wait_key = false;
+                LOG("[movie] opening: resuming at keyframe %.3f s\n",
+                    e->pkt->pts * av_q2d(e->fmt->streams[e->pkt->stream_index]->time_base));
+            } else {
+                sel = false;
+            }
+        }
+        if (sel) e->have_pkt = true;
         else av_packet_unref(e->pkt);
     }
 }

@@ -41,6 +41,7 @@ typedef struct {
     bool custom_border, divisor, host_import;
     bool ahb_import;           // (Android) guest heap imported from its AHardwareBuffer, read through buffer addresses
     bool exec_stats;           // EOWRECOMP_VK_STATS: pipeline compile statistics logged (VK_KHR_pipeline_executable_properties)
+    bool draw_indirect_count, multi_draw_indirect;
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;

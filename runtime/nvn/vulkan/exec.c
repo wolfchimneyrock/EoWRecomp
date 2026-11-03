@@ -19,9 +19,9 @@
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 // why draws / dispatches were skipped (the fps log line: "skipped N (why...)")
 enum { SKIP_NO_PROGRAM, SKIP_PROG_PENDING, SKIP_PROG_FAILED, SKIP_PIPE_PENDING, SKIP_PIPE_FAILED, SKIP_TOPOLOGY,
-       SKIP_COMPUTE_PROG, SKIP_LIST, SKIP_NREASONS };
+       SKIP_COMPUTE_PROG, SKIP_LIST, SKIP_INDIRECT, SKIP_NREASONS };
 static const char *const skip_names[SKIP_NREASONS] = {"no program", "program compiling", "program failed",
-    "pipeline compiling", "pipeline failed", "topology", "compute program", "skip list"};
+    "pipeline compiling", "pipeline failed", "topology", "compute program", "skip list", "indirect unsupported"};
 static uint64_t stat_skip_why[SKIP_NREASONS];
 #define SKIP(why) (stat_skipped++, stat_skip_why[why]++)
 static uint64_t stat_upload_bytes;
@@ -40,6 +40,7 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
 _Atomic unsigned vk_pipelines_made;  // (never reset: device.c saves the pipeline cache when it grew)
+static _Atomic uint64_t stat_tr_ns, stat_spv_ns, stat_pipe_ns;  // shader build time (summed over threads)
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 long g_debug_frame_index = -1;
@@ -772,6 +773,7 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
 // EOWRECOMP_SYNC_SHADERS=1 builds on first use, blocking (deterministic tests).
 typedef struct Job { void (*fn)(void *); void *arg; struct Job *next; } Job;
 static Job *jobs_head, *jobs_tail;
+static Job *wjobs_head, *wjobs_tail;  // low priority: shader warm-up (runs only while no game build is queued)
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
@@ -787,10 +789,17 @@ static void *worker(void *a) {
 #endif
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
-        while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
-        Job *j = jobs_head;
-        jobs_head = j->next;
-        if (!jobs_head) jobs_tail = NULL;
+        while (!jobs_head && !wjobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
+        Job *j;
+        if (jobs_head) {
+            j = jobs_head;
+            jobs_head = j->next;
+            if (!jobs_head) jobs_tail = NULL;
+        } else {
+            j = wjobs_head;
+            wjobs_head = j->next;
+            if (!wjobs_head) wjobs_tail = NULL;
+        }
         pthread_mutex_unlock(&jobs_lock);
         j->fn(j->arg);
         free(j);
@@ -878,6 +887,14 @@ static void *translator(void *a) {
     return NULL;
 }
 static bool sync_shaders(void);
+// Graphics shaders now translate on the worker pool, in parallel (the translator's only shared scratch, RSC2's string
+// ring, is per thread). Entering a new area needs hundreds of programs; one translator thread made that a ~10 s crawl
+// at 2-12 fps with most draws skipped (black screen). EOWRECOMP_SERIAL_TRANSLATE=1 = old single translator thread.
+static bool serial_translate(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("EOWRECOMP_SERIAL_TRANSLATE"); v = e && *e == '1'; }
+    return v;
+}
 static void run_translate(void (*fn)(void *), void *arg) {
     if (sync_shaders()) { fn(arg); return; }
     static bool started;
@@ -891,29 +908,98 @@ static void run_translate(void (*fn)(void *), void *arg) {
     pthread_mutex_unlock(&tjobs_lock);
 }
 
-static void run_job(void (*fn)(void *), void *arg) {
-    if (sync_shaders()) { fn(arg); return; }
-    static bool started;
-    if (!started) {
-        started = true;
-        // first entry into an area builds dozens of pipelines at once: use most of the CPU (draws wait for them)
-        int n = SDL_GetNumLogicalCPUCores() - 4;
-        if (n < 4) n = 4;
-        if (n > 16) n = 16;
-        if (getenv("EOWRECOMP_VK_WORKERS")) n = atoi(getenv("EOWRECOMP_VK_WORKERS"));
-        if (n < 1) n = 1;
-        if (n > 20) n = 20;
-        LOG("[vk] %d shader / pipeline workers\n", n);
-        { pthread_t t; pthread_create(&t, NULL, job_watchdog, NULL); }
-        for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
+// Wait for a pending compile instead of skipping the draw (skips showed as black screens on entering an area, a
+// one-frame flicker at every room change, and objects missing while their collision worked). The render thread waits
+// up to EOWRECOMP_SHADER_WAIT_MS (default 400) per frame in total, then falls back to skipping. The previous frame
+// stays on screen while it waits, so a new area shows a short pause instead of a black or half-drawn frame.
+// EOWRECOMP_SHADER_WAIT_MS=0 = old behaviour (always skip).
+// Some pipelines take seconds to build (seen during screen fades: 2.4 fps for ~5 s while every frame waited the full
+// 400 ms for the same few pipelines). So each pending item is also waited on for at most EOWRECOMP_SHADER_WAIT_ITEM_MS
+// (default 150) in total, across frames; after that its draws are skipped until it is ready, and the game keeps running.
+// User preference (2026-11-02): a longer pause on entering a new area is better than laggy/half-drawn frames after it.
+// So both defaults are now 10 s: the frame holds until every pending build is done (builds run in parallel on the
+// worker pool), then the area plays smoothly. The 10 s cap only guards against a build that never finishes.
+// Old feel: EOWRECOMP_SHADER_WAIT_MS=400 EOWRECOMP_SHADER_WAIT_ITEM_MS=150.
+#define WAITED_TAB 512
+static struct { _Atomic int *state; uint64_t ns; } waited_tab[WAITED_TAB];
+static uint64_t *waited_slot(_Atomic int *state) {
+    uint32_t h = (uint32_t)(((uintptr_t)state >> 4) * 0x9E3779B1u) & (WAITED_TAB - 1);
+    for (int i = 0; i < 16; i++) {
+        uint32_t s = (h + i) & (WAITED_TAB - 1);
+        if (waited_tab[s].state == state) return &waited_tab[s].ns;
+        // reuse slots of items that finished building
+        if (!waited_tab[s].state || atomic_load(waited_tab[s].state) != 0) {
+            waited_tab[s].state = state;
+            waited_tab[s].ns = 0;
+            return &waited_tab[s].ns;
+        }
     }
+    return NULL;  // table crowded: fall back to the per-frame budget only
+}
+static uint64_t shader_wait_frame, shader_wait_used_ns, stat_shader_wait_ns;
+static void wait_compile(_Atomic int *state) {
+    if (atomic_load(state) != 0) return;
+    static int64_t budget_ns = -1, item_ns = -1;
+    if (budget_ns < 0) {
+        const char *e = getenv("EOWRECOMP_SHADER_WAIT_MS");
+        budget_ns = (e ? atoll(e) : 10000) * 1000000ll;
+        if (budget_ns < 0) budget_ns = 0;
+        e = getenv("EOWRECOMP_SHADER_WAIT_ITEM_MS");
+        item_ns = (e ? atoll(e) : 10000) * 1000000ll;
+        if (item_ns <= 0) item_ns = INT64_MAX;
+    }
+    uint64_t frame = vk_frame_counter();
+    if (frame != shader_wait_frame) { shader_wait_frame = frame; shader_wait_used_ns = 0; }
+    if (shader_wait_used_ns >= (uint64_t)budget_ns) return;
+    uint64_t *waited = waited_slot(state);
+    if (waited && *waited >= (uint64_t)item_ns) return;
+    uint64_t left = (uint64_t)budget_ns - shader_wait_used_ns;
+    if (waited && (uint64_t)item_ns - *waited < left) left = (uint64_t)item_ns - *waited;
+    uint64_t t0 = SDL_GetTicksNS(), end = t0 + left;
+    while (atomic_load(state) == 0 && SDL_GetTicksNS() < end) SDL_DelayNS(100000);
+    uint64_t dt = SDL_GetTicksNS() - t0;
+    shader_wait_used_ns += dt;
+    stat_shader_wait_ns += dt;
+    if (waited) {
+        *waited += dt;
+        if (*waited >= (uint64_t)item_ns && atomic_load(state) == 0) {
+            static int n;
+            if (n++ < 20) LOG("[vk] slow shader/pipeline build (%p): waited %llu ms, skipping its draws until ready\n",
+                              (void *)state, (unsigned long long)(*waited / 1000000));
+        }
+    }
+}
+
+static void start_workers(void) {  // (render thread only)
+    static bool started;
+    if (started) return;
+    started = true;
+    // first entry into an area builds dozens of pipelines at once: use most of the CPU (draws wait for them)
+    int n = SDL_GetNumLogicalCPUCores() - 4;
+    if (n < 4) n = 4;
+    if (n > 16) n = 16;
+    if (getenv("EOWRECOMP_VK_WORKERS")) n = atoi(getenv("EOWRECOMP_VK_WORKERS"));
+    if (n < 1) n = 1;
+    if (n > 20) n = 20;
+    LOG("[vk] %d shader / pipeline workers\n", n);
+    { pthread_t t; pthread_create(&t, NULL, job_watchdog, NULL); }
+    for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
+}
+
+static void queue_job(void (*fn)(void *), void *arg, bool low) {
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
     pthread_mutex_lock(&jobs_lock);
-    if (jobs_tail) jobs_tail->next = j; else jobs_head = j;
-    jobs_tail = j;
+    if (low) { if (wjobs_tail) wjobs_tail->next = j; else wjobs_head = j; wjobs_tail = j; }
+    else { if (jobs_tail) jobs_tail->next = j; else jobs_head = j; jobs_tail = j; }
     pthread_cond_signal(&jobs_cond);
     pthread_mutex_unlock(&jobs_lock);
+}
+
+static void run_job(void (*fn)(void *), void *arg) {
+    if (sync_shaders()) { fn(arg); return; }
+    start_workers();
+    queue_job(fn, arg, false);
 }
 
 // ================================================================== state
@@ -992,6 +1078,19 @@ const char *renderer_stats(void) {
         snprintf(stats_text + n, sizeof stats_text - n, ", cache clean %.1fMB inval %.1fMB", (double)stat_clean_bytes / 1048576.0,
                  (double)stat_inval_bytes / 1048576.0);
         stat_clean_bytes = stat_inval_bytes = 0;
+    }
+    if (stat_shader_wait_ns) {
+        size_t n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, ", shader wait %.0fms", (double)stat_shader_wait_ns / 1e6);
+        stat_shader_wait_ns = 0;
+    }
+    {
+        uint64_t tr = atomic_exchange(&stat_tr_ns, 0), spv = atomic_exchange(&stat_spv_ns, 0), pp = atomic_exchange(&stat_pipe_ns, 0);
+        if (tr || spv || pp) {
+            size_t n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, ", build: translate %.0fms spirv %.0fms pipeline %.0fms",
+                     tr / 1e6, spv / 1e6, pp / 1e6);
+        }
     }
     if (stat_skipped) {
         size_t n = strlen(stats_text);
@@ -1476,6 +1575,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
 typedef struct {
     ShaderInfo *vi, *fi;
     uint64_t code[2], cmax[2];  // translation inputs (copied: translated on the translator thread)
+    uint32_t csize[2];          // compiler constants (c1) size, at code + cmax (0: none)
     ShaderKey vkey, fkey;
     VkShaderModule vs, fs;
     VkBindingInfo binds[MAX_BIND];
@@ -1484,7 +1584,21 @@ typedef struct {
     VkPipelineLayout layout;
     bool vs_uses_vid;
     _Atomic int state;  // 0 building, 1 ready, 2 failed
+    // shader warm-up (see "shader warm-up" below)
+    uint64_t hash;              // prog_tab key
+    const uint8_t *src[2];      // warm: saved copy of the code (+ c1) to translate from, NULL = guest memory
+    uint64_t chash[2];          // warm: hash of the saved code bytes (checked against guest memory on first use)
+    uint32_t clen[2];
+    bool warm, verified;
+    _Atomic int claimed;        // warm: a worker started building it
+    void **wpipes;              // warm: this program's saved pipelines (Pipe *), built after it
+    int nwpipes, capwpipes;
 } Prog;
+static void warm_record_prog(Prog *p);
+static bool warm_verify(Prog *p, NvnProgram *np);
+static void warm_prog_run(void *arg);
+static void warm_drop(Prog *p);
+static void warm_init(void);
 
 static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, VkShaderStageFlags s1) {
     p->set_layout[0] = vk_set_layout(p->binds, p->nbinds, 0, s0);
@@ -1536,8 +1650,10 @@ static void compile_program(void *arg) {
 }
 static void compile_program_(Prog *p) {
     size_t nv = 0, nf = 0;
+    uint64_t t0 = SDL_GetTicksNS();
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
+    atomic_fetch_add(&stat_spv_ns, SDL_GetTicksNS() - t0);
     if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
@@ -1547,6 +1663,7 @@ static void compile_program_(Prog *p) {
     free(sf);
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
+    if (p->vs && p->fs && !p->warm) warm_record_prog(p);  // (before the state store: the code is still unchanged)
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
@@ -1595,13 +1712,18 @@ static void translate_program(void *arg) {
     gmem_translate_params();
     native_half_decide();
     gmem_split_decide();
-    pthread_mutex_lock(&translate_lock);
-    p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
+    uint64_t t0 = SDL_GetTicksNS();
+    bool serial = serial_translate();
+    if (serial) pthread_mutex_lock(&translate_lock);
+    const uint8_t *src0 = p->src[0] ? p->src[0] : (const uint8_t *)(uintptr_t)p->code[0];
+    const uint8_t *src1 = p->src[1] ? p->src[1] : (const uint8_t *)(uintptr_t)p->code[1];
+    p->vi = maxwell_translate(src0, p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
-        p->fi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
+        p->fi = maxwell_translate(src1, p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
-    pthread_mutex_unlock(&translate_lock);
+    if (serial) pthread_mutex_unlock(&translate_lock);
+    atomic_fetch_add(&stat_tr_ns, SDL_GetTicksNS() - t0);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
         atomic_store(&p->state, 2);
@@ -1617,14 +1739,16 @@ static void translate_program(void *arg) {
     override_glsl(p->fi, p->code[1], "fs");
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
-    run_job(compile_program, p);
+    if (serial) run_job(compile_program, p);
+    else compile_program(p);  // already on a worker: finish this program now instead of queueing behind every translation
 }
 
-#define PROG_TAB 4096
+#define PROG_TAB 8192
 static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
 
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
+    warm_init();
     uint64_t h = 0xcbf29ce484222325ull;
     for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
     const uint8_t *vb = (const uint8_t *)vkey;
@@ -1634,17 +1758,29 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
-    if (prog_tab[slot].key) return prog_tab[slot].prog;
+    if (prog_tab[slot].key) {
+        Prog *q = prog_tab[slot].prog;
+        if (!q->warm || q->verified) return q;
+        if (warm_verify(q, np)) {
+            q->verified = true;
+            if (!atomic_load(&q->claimed)) run_job(warm_prog_run, q);  // needed now: jump the warm-up queue
+            return q;
+        }
+        warm_drop(q);  // saved code doesn't match this run's shader: drop it, build normally
+    }
     Prog *p = calloc(1, sizeof *p);
+    p->hash = h;
     prog_tab[slot].key = h;
     prog_tab[slot].prog = p;
     for (int i = 0; i < 2; i++) {
         p->code[i] = np->stages[i].code_addr;
         p->cmax[i] = np->stages[i].const_offset ? np->stages[i].const_offset : 0x10000;
+        p->csize[i] = np->stages[i].const_offset ? np->stages[i].const_size : 0;
     }
     p->vkey = *vkey;
     p->fkey = *fkey;
-    run_translate(translate_program, p);
+    if (serial_translate()) run_translate(translate_program, p);
+    else run_job(translate_program, p);
     return p;
 }
 
@@ -1833,8 +1969,9 @@ typedef struct {
     uint32_t write_mask[8];
 } PipeKey;
 
-typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; } Pipe;  // state: 0 building, 1 ready, 2 failed
-#define PIPE_TAB 8192
+typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; bool warm, promoted; _Atomic int claimed; } Pipe;  // state: 0 building, 1 ready, 2 failed
+static void warm_record_pipe(Pipe *pp);
+#define PIPE_TAB 32768
 static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
 
 // 8 bytes a step (PipeKey is ~700 bytes, hashed per draw); in-memory tables only - hmix values are compared with
@@ -1913,9 +2050,24 @@ static void build_pipeline(void *arg) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
     if (g_vk.exec_stats) pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    {  // test switch: EOWRECOMP_VK_PIPE_NOOPT=1 asks the driver for unoptimized (faster to build?) pipelines
+        static int noopt = -1;
+        if (noopt < 0) { const char *e = getenv("EOWRECOMP_VK_PIPE_NOOPT"); noopt = e && atoi(e); }
+        if (noopt) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
+    uint64_t t0 = SDL_GetTicksNS();
     job_begin("pipeline vs %llx fs %llx", (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     job_end();
+    uint64_t dt = SDL_GetTicksNS() - t0;
+    atomic_fetch_add(&stat_pipe_ns, dt);
+    if (dt > 300000000ull) {  // a few pipelines take the NVIDIA driver 10+ s: name them
+        static _Atomic int n;
+        if (atomic_fetch_add(&n, 1) < 40)
+            LOG("[vk] slow pipeline: %.0f ms, vs %llx (%zu chars) fs %llx (%zu chars)\n", dt / 1e6,
+                (unsigned long long)k->prog->code[0], k->prog->vi && k->prog->vi->msl ? strlen(k->prog->vi->msl) : 0,
+                (unsigned long long)k->prog->code[1], k->prog->fi && k->prog->fi->msl ? strlen(k->prog->fi->msl) : 0);
+    }
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
@@ -1948,7 +2100,256 @@ static void build_pipeline(void *arg) {
         }
     }
     atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
+    if (r == VK_SUCCESS && !pp->warm) warm_record_pipe(pp);
     atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
+}
+
+// ================================================================== shader warm-up
+// Every shader program and graphics pipeline built is saved to cache/vk_warm.bin (the program's code bytes and keys,
+// the pipeline's state). On the next run all of them are rebuilt in the background from start-up, at low priority
+// (the game's own builds always go first), so an effect or area seen on any earlier run no longer stalls when it
+// appears again (user 2026-11-02: lag on new areas and on new effects like splashing into water). A saved program is
+// only used after its code has been checked against this run's guest memory. Built pipelines also land in the
+// driver's pipeline cache as before. EOWRECOMP_SHADER_WARM=0 = off (nothing loaded or saved).
+#define WARM_PATH "cache/vk_warm.bin"
+#define WARM_MAGIC "EOWWARM1"
+enum { WARM_BLOB = 1, WARM_PROG = 2, WARM_PIPE = 3 };
+typedef struct {
+    uint64_t h, code[2], cmax[2], chash[2];
+    uint32_t csize[2], clen[2];
+    ShaderKey vkey, fkey;
+} WarmProg;
+static pthread_mutex_t warm_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *warm_f;
+#define WARM_SET 65536
+static uint64_t warm_blob_set[WARM_SET];  // code blobs already in the file (under warm_lock)
+static _Atomic int warm_left;
+static uint64_t warm_t0;
+
+static bool warm_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("EOWRECOMP_SHADER_WARM"); v = !(e && *e == '0') && !sync_shaders() && !serial_translate(); }
+    return v;
+}
+
+static uint64_t warm_hash(const uint8_t *b, size_t n) { return hash_words(0x84222325cbf29ce4ull, b, n) | 1; }
+
+static bool warm_set_add(uint64_t h) {  // true if new
+    uint32_t s = (uint32_t)(h ^ (h >> 32)) & (WARM_SET - 1);
+    for (int i = 0; i < WARM_SET; i++, s = (s + 1) & (WARM_SET - 1)) {
+        if (warm_blob_set[s] == h) return false;
+        if (!warm_blob_set[s]) { warm_blob_set[s] = h; return true; }
+    }
+    return false;  // (full: don't save more code)
+}
+
+static void warm_write(uint32_t type, const void *a, uint32_t na, const void *b, uint32_t nb) {  // (warm_lock held)
+    uint32_t len = (na + nb + 7) & ~7u;  // records stay 8-byte aligned (code blobs are read in place after loading)
+    uint32_t hd[2] = {type, len};
+    static const uint8_t pad[8];
+    fwrite(hd, sizeof hd, 1, warm_f);
+    fwrite(a, na, 1, warm_f);
+    if (nb) fwrite(b, nb, 1, warm_f);
+    if (len > na + nb) fwrite(pad, len - na - nb, 1, warm_f);
+}
+
+static void warm_record_prog(Prog *p) {
+    if (!warm_f) return;
+    WarmProg w;
+    memset(&w, 0, sizeof w);
+    w.h = p->hash;
+    for (int i = 0; i < 2; i++) {
+        if (!p->csize[i] && p->cmax[i] == 0x10000) return;  // (code size unknown: don't copy past it)
+        w.code[i] = p->code[i];
+        w.cmax[i] = p->cmax[i];
+        w.csize[i] = p->csize[i];
+        w.clen[i] = (uint32_t)p->cmax[i] + p->csize[i];
+        w.chash[i] = warm_hash((const uint8_t *)(uintptr_t)p->code[i], w.clen[i]);
+    }
+    w.vkey = p->vkey;
+    w.fkey = p->fkey;
+    pthread_mutex_lock(&warm_lock);
+    for (int i = 0; i < 2; i++)
+        if (warm_set_add(w.chash[i])) warm_write(WARM_BLOB, &w.chash[i], 8, (const void *)(uintptr_t)p->code[i], w.clen[i]);
+    warm_write(WARM_PROG, &w, sizeof w, NULL, 0);
+    fflush(warm_f);
+    pthread_mutex_unlock(&warm_lock);
+}
+
+static void warm_record_pipe(Pipe *pp) {
+    if (!warm_f || !pp->k.prog->hash) return;
+    PipeKey k = pp->k;
+    uint64_t ph = k.prog->hash;
+    k.prog = NULL;
+    pthread_mutex_lock(&warm_lock);
+    warm_write(WARM_PIPE, &ph, 8, &k, sizeof k);
+    fflush(warm_f);
+    pthread_mutex_unlock(&warm_lock);
+}
+
+static bool warm_verify(Prog *p, NvnProgram *np) {
+    for (int i = 0; i < 2; i++) {
+        uint64_t cmax = np->stages[i].const_offset ? np->stages[i].const_offset : 0x10000;
+        uint32_t csize = np->stages[i].const_offset ? np->stages[i].const_size : 0;
+        if (np->stages[i].code_addr != p->code[i] || cmax != p->cmax[i] || csize != p->csize[i]) return false;
+        if (warm_hash((const uint8_t *)(uintptr_t)p->code[i], p->clen[i]) != p->chash[i]) return false;
+    }
+    return true;
+}
+
+static void warm_one_done(void) {
+    if (atomic_fetch_sub(&warm_left, 1) == 1)
+        LOG("[vk] shader warm-up: all saved programs built (%.1f s)\n", (SDL_GetTicksNS() - warm_t0) / 1e9);
+}
+
+static void warm_drop(Prog *p) {
+    if (!atomic_exchange(&p->claimed, 1)) warm_one_done();
+}
+
+static void warm_pipe_run(void *arg) {
+    Pipe *pp = arg;
+    if (atomic_exchange(&pp->claimed, 1)) return;
+    build_pipeline(pp);
+}
+
+static void warm_prog_run(void *arg) {
+    Prog *p = arg;
+    if (atomic_exchange(&p->claimed, 1)) return;
+    translate_program(p);  // (translates, then compiles on this thread)
+    bool ok = atomic_load(&p->state) == 1;
+    for (int i = 0; i < p->nwpipes; i++) {
+        Pipe *pp = p->wpipes[i];
+        if (ok) queue_job(warm_pipe_run, pp, true);
+        else { atomic_store(&pp->claimed, 1); atomic_store(&pp->state, 2); }
+    }
+    warm_one_done();
+}
+
+typedef struct { uint64_t h; const uint8_t *data; uint32_t len; } WarmBlob;
+
+static const WarmBlob *warm_blob_find(WarmBlob *tab, uint64_t h) {
+    uint32_t s = (uint32_t)(h ^ (h >> 32)) & (WARM_SET - 1);
+    for (int i = 0; i < WARM_SET && tab[s].h; i++, s = (s + 1) & (WARM_SET - 1))
+        if (tab[s].h == h) return &tab[s];
+    return NULL;
+}
+
+static Prog *warm_prog_find(uint64_t h) {
+    uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
+    while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
+    return prog_tab[slot].key ? prog_tab[slot].prog : NULL;
+}
+
+static void warm_init(void) {  // (render thread, before the first program lookup)
+    static bool done;
+    if (done) return;
+    done = true;
+    if (!warm_on()) return;
+    warm_t0 = SDL_GetTicksNS();
+    mkdir("cache", 0755);
+    uint8_t *buf = NULL;
+    size_t sz = 0;
+    FILE *f = fopen(WARM_PATH, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 0 && (buf = malloc((size_t)n)) && fread(buf, 1, (size_t)n, f) == (size_t)n) sz = (size_t)n;
+        fclose(f);
+    }
+    uint32_t sizes[2] = {(uint32_t)sizeof(ShaderKey), (uint32_t)sizeof(PipeKey)};
+    bool ok = sz >= 16 && !memcmp(buf, WARM_MAGIC, 8) && !memcmp(buf + 8, sizes, 8);
+    size_t end = 16;
+    int nprog = 0, npipe = 0, nblob = 0;
+    if (ok) {
+        WarmBlob *blobs = calloc(WARM_SET, sizeof *blobs);
+        for (int pass = 0; pass < 3; pass++) {
+            for (size_t off = 16; off + 8 <= sz;) {
+                uint32_t hd[2];
+                memcpy(hd, buf + off, 8);
+                if (hd[1] > sz - off - 8) break;  // (cut-off record at the end: an earlier run was killed mid-write)
+                const uint8_t *pl = buf + off + 8;
+                off += 8 + hd[1];
+                if (pass == 0) end = off;
+                if (pass == 0 && hd[0] == WARM_BLOB && hd[1] >= 8) {
+                    uint64_t h;
+                    memcpy(&h, pl, 8);
+                    if (!warm_set_add(h)) continue;
+                    uint32_t s = (uint32_t)(h ^ (h >> 32)) & (WARM_SET - 1);
+                    while (blobs[s].h) s = (s + 1) & (WARM_SET - 1);
+                    blobs[s] = (WarmBlob){h, pl + 8, hd[1] - 8};
+                    nblob++;
+                } else if (pass == 1 && hd[0] == WARM_PROG && hd[1] >= sizeof(WarmProg)) {
+                    WarmProg w;
+                    memcpy(&w, pl, sizeof w);
+                    const WarmBlob *b0 = warm_blob_find(blobs, w.chash[0]), *b1 = warm_blob_find(blobs, w.chash[1]);
+                    if (!w.h || !b0 || !b1 || b0->len < w.clen[0] || b1->len < w.clen[1]) continue;
+                    if (warm_prog_find(w.h) || nprog >= PROG_TAB / 2) continue;
+                    Prog *p = calloc(1, sizeof *p);
+                    p->hash = w.h;
+                    for (int i = 0; i < 2; i++) {
+                        p->code[i] = w.code[i];
+                        p->cmax[i] = w.cmax[i];
+                        p->csize[i] = w.csize[i];
+                        p->chash[i] = w.chash[i];
+                        p->clen[i] = w.clen[i];
+                    }
+                    p->src[0] = b0->data;
+                    p->src[1] = b1->data;
+                    p->vkey = w.vkey;
+                    p->fkey = w.fkey;
+                    p->warm = true;
+                    uint32_t slot = (uint32_t)(w.h ^ (w.h >> 31)) & (PROG_TAB - 1);
+                    while (prog_tab[slot].key) slot = (slot + 1) & (PROG_TAB - 1);
+                    prog_tab[slot].key = w.h;
+                    prog_tab[slot].prog = p;
+                    nprog++;
+                } else if (pass == 2 && hd[0] == WARM_PIPE && hd[1] >= 8 + sizeof(PipeKey)) {
+                    uint64_t h;
+                    memcpy(&h, pl, 8);
+                    Prog *p = warm_prog_find(h);
+                    if (!p || !p->warm || npipe >= PIPE_TAB / 2) continue;
+                    PipeKey k;
+                    memcpy(&k, pl + 8, sizeof k);
+                    k.prog = p;
+                    uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
+                    if (!ph) ph = 1;
+                    uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
+                    while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
+                    if (pipe_tab[pslot].key) continue;  // (saved twice)
+                    Pipe *pp = calloc(1, sizeof *pp);
+                    pp->k = k;
+                    pp->warm = true;
+                    pipe_tab[pslot].key = ph;
+                    pipe_tab[pslot].pipe = pp;
+                    if (p->nwpipes == p->capwpipes) {
+                        p->capwpipes = p->capwpipes ? p->capwpipes * 2 : 8;
+                        p->wpipes = realloc(p->wpipes, (size_t)p->capwpipes * sizeof *p->wpipes);
+                    }
+                    p->wpipes[p->nwpipes++] = pp;
+                    npipe++;
+                }
+            }
+        }
+        free(blobs);  // (the code bytes stay in buf, which is kept)
+    }
+    if (ok && end == sz) {
+        warm_f = fopen(WARM_PATH, "ab");
+    } else {  // new, from an older build (key layout changed), or cut off: rewrite (keeping the good part)
+        warm_f = fopen(WARM_PATH, "wb");
+        if (warm_f) {
+            if (ok) fwrite(buf, 1, end, warm_f);
+            else { fwrite(WARM_MAGIC, 8, 1, warm_f); fwrite(sizes, 8, 1, warm_f); }
+            fflush(warm_f);
+        }
+    }
+    if (!warm_f) LOG("[vk] shader warm-up: can't write %s\n", WARM_PATH);
+    if (!nprog) { if (!ok) free(buf); return; }
+    atomic_store(&warm_left, nprog);
+    start_workers();
+    for (int s = 0; s < PROG_TAB; s++)
+        if (prog_tab[s].key && prog_tab[s].prog->warm) queue_job(warm_prog_run, prog_tab[s].prog, true);
+    LOG("[vk] shader warm-up: building %d programs, %d pipelines saved by earlier runs (%.1f MB)\n", nprog, npipe, sz / 1e6);
 }
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
@@ -3160,9 +3561,12 @@ static CsProg *compute_program(NvnProgram *np) {
     gmem_split_decide();
     ShaderKey k = {0};
     k.glsl = 1;
-    pthread_mutex_lock(&translate_lock);
+    bool serial = serial_translate();
+    uint64_t t0 = SDL_GetTicksNS();
+    if (serial) pthread_mutex_lock(&translate_lock);
     cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
-    pthread_mutex_unlock(&translate_lock);
+    if (serial) pthread_mutex_unlock(&translate_lock);
+    atomic_fetch_add(&stat_tr_ns, SDL_GetTicksNS() - t0);
     cp->p.vi = cp->si;
     if (!cp->si->msl) {
         LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, (unsigned long long)ss->code_addr);
@@ -3190,6 +3594,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
+    if (cp) wait_compile(&cp->p.state);
     if (!cp || atomic_load(&cp->p.state) != 1) { SKIP(SKIP_COMPUTE_PROG); return; }
     {   // EOWRECOMP_SKIP_CS=<code address hex> (debug): skip that compute shader's dispatches, to see what it does
         static uint64_t skip = ~0ull;
@@ -3293,6 +3698,33 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
 }
 
 static void draw_(CmdRec *r, bool indexed);
+static void draw(CmdRec *r, bool indexed);
+// Indirect draws (cmdbuf.c layout): the draw record above, set while draw_ runs a converted CMD_DRAW_*_INDIRECT; the
+// counts stay on the GPU (vkCmdDraw*Indirect[Count] reading the heap, after the culling dispatch's barriers).
+static const CmdRec *g_ind;
+static bool g_ind_elems;
+// The imported heap at a guest address, in place (no vertex cache: the GPU writes these itself).
+static bool heap_span(uint64_t addr, VkBuffer *buf, VkDeviceSize *off) {
+    if (addr < HEAP_BASE) return false;
+    if (addr + 64 > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
+    if (!gmem_buf || addr + 64 > HEAP_BASE + gmem_size) return false;
+    *buf = gmem_buf;
+    *off = addr - HEAP_BASE;
+    return true;
+}
+static void draw_indirect(CmdRec *r, bool elems) {
+    CmdRec t;
+    memset(&t, 0, sizeof t);
+    t.op = elems ? CMD_DRAW_ELEMENTS : CMD_DRAW_ARRAYS;
+    t.x[0] = r->x[0];
+    t.x[2] = 0xFFFFFFFFu;  // (count unknown here: never taken for a full-screen quad)
+    if (elems) { t.x[1] = r->x[1]; t.x[3] = r->x[2]; t.x[6] = 1; }
+    else t.x[4] = 1;
+    g_ind = r;
+    g_ind_elems = elems;
+    draw(&t, elems);
+    g_ind = NULL;
+}
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     draw_(r, indexed);
@@ -3309,9 +3741,11 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
+    if (pr) wait_compile(&pr->state);
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return; }
     if ((fkey.stencil_tex = stencil_slots(1, pr->fi))) {  // a stencil view bound: the variant with integer samplers
         pr = get_program(st.program, &vkey, &fkey);
+        if (pr) wait_compile(&pr->state);
         if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr && atomic_load(&pr->state) == 0 ? SKIP_PROG_PENDING : SKIP_PROG_FAILED); return; }
     }
     {   // EOWRECOMP_SKIP_VS=<vs>[/<count>],...: during a debug-frame series (EOWRECOMP_DEBUG_FRAME + _FRAMES), frame k of
@@ -3371,6 +3805,12 @@ static void draw_(CmdRec *r, bool indexed) {
     uint8_t cls;
     bool native = topology(mode, &topo, &cls);
     if (!native && mode != 6 && mode != 7 && mode != 9) { SKIP(SKIP_TOPOLOGY); return; }
+    if (g_ind && (!native || (indexed && r->x[1] == 0))) {  // (quads / fans / 8-bit indices need the counts on the CPU)
+        static int n;
+        if (n++ < 8) LOG("[vk] indirect draw skipped: mode %u index type %llu\n", mode, (unsigned long long)r->x[1]);
+        SKIP(SKIP_INDIRECT);
+        return;
+    }
 
     uint64_t prof_tk_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_pre += prof_tk_ - prof_tp_;
@@ -3429,7 +3869,11 @@ static void draw_(CmdRec *r, bool indexed) {
         pipe_tab[pslot].key = ph;
         pipe_tab[pslot].pipe = pp;
         run_job(build_pipeline, pp);
+    } else if (pp->warm && !pp->promoted && !atomic_load(&pp->claimed)) {
+        pp->promoted = true;
+        run_job(warm_pipe_run, pp);  // saved pipeline not built yet but needed now: jump the warm-up queue
     }
+    wait_compile(&pp->state);
     if (atomic_load(&pp->state) != 1) { SKIP(atomic_load(&pp->state) == 0 ? SKIP_PIPE_PENDING : SKIP_PIPE_FAILED); return; }
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
@@ -3603,7 +4047,10 @@ static void draw_(CmdRec *r, bool indexed) {
         inst = (uint32_t)r->x[6] ? (uint32_t)r->x[6] : 1;
         const void *src = (const void *)(uintptr_t)iaddr;
         uint32_t restart = st.prim_restart ? st.restart_index : 0xFFFFFFFFu;
-        if (native && itype != 0) {
+        if (g_ind) {  // (native, 16/32-bit: checked above) the index buffer in place, its range unknown here
+            itype_vk = itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+            if (iaddr % (itype == 1 ? 2 : 4) || !heap_span(iaddr, &ib.buf, &ib.off)) { SKIP(SKIP_INDIRECT); return; }
+        } else if (native && itype != 0) {
             uint32_t isz = itype == 1 ? 2 : 4;
             itype_vk = itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
             icount = count;
@@ -3663,6 +4110,7 @@ static void draw_(CmdRec *r, bool indexed) {
             }
             uint64_t stride = k.stride[s], need;
             if (!stride) need = 256;
+            else if (g_ind) need = v.size ? v.size : 1 << 20;  // (indirect: the counts are on the GPU)
             else if (k.divisor[s]) need = ((uint64_t)base_inst + inst + k.divisor[s] - 1) / k.divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
             if (v.size && need > v.size) need = v.size;
@@ -3690,6 +4138,35 @@ static void draw_(CmdRec *r, bool indexed) {
         if (per_draw && g_gpuprof_frame)
             gp_mark(cb, "draw vs %llx fs %llx, %u %s", (unsigned long long)st.program->stages[0].code_addr,
                     (unsigned long long)st.program->stages[1].code_addr, use_index ? icount : count, use_index ? "indices" : "vertices");
+    }
+    if (g_ind) {
+        const CmdRec *q = g_ind;
+        uint64_t iaddr = g_ind_elems ? q->x[3] : q->x[1], caddr = g_ind_elems ? q->x[4] : q->x[2];
+        uint32_t maxn = (uint32_t)(g_ind_elems ? q->x[5] : q->x[3]), stride = (uint32_t)(g_ind_elems ? q->x[6] : q->x[4]);
+        VkBuffer ab, cbuf;
+        VkDeviceSize ao, co;
+        static int logged;
+        if (logged++ < 8)
+            LOG("[vk] indirect draw: %s mode %u args %llx count %llx max %u stride %u vs %llx\n", g_ind_elems ? "elements" : "arrays",
+                mode, (unsigned long long)iaddr, (unsigned long long)caddr, maxn, stride,
+                (unsigned long long)st.program->stages[0].code_addr);
+        if ((iaddr & 3) || !heap_span(iaddr, &ab, &ao) || stride < (g_ind_elems ? 20u : 16u) || (stride & 3) || !maxn) {
+            SKIP(SKIP_INDIRECT);
+            return;
+        }
+        if (!caddr) {
+            if (g_ind_elems) vkCmdDrawIndexedIndirect(cb, ab, ao, 1, stride);
+            else vkCmdDrawIndirect(cb, ab, ao, 1, stride);
+        } else if (g_vk.draw_indirect_count && !(caddr & 3) && heap_span(caddr, &cbuf, &co)) {
+            if (g_ind_elems) vkCmdDrawIndexedIndirectCount(cb, ab, ao, cbuf, co, maxn, stride);
+            else vkCmdDrawIndirectCount(cb, ab, ao, cbuf, co, maxn, stride);
+        } else {
+            SKIP(SKIP_INDIRECT);
+            return;
+        }
+        stat_draws++;
+        cum_draws++;
+        return;
     }
     for (int ri = 0; ri < nruns; ri++) {
         if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
@@ -4489,6 +4966,8 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_DISPATCH: dispatch_compute((uint32_t)r->x[0], (uint32_t)r->x[1], (uint32_t)r->x[2]); break;
         case CMD_DRAW_ARRAYS: draw(r, false); break;
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
+        case CMD_DRAW_ARRAYS_INDIRECT: draw_indirect(r, false); break;
+        case CMD_DRAW_ELEMENTS_INDIRECT: draw_indirect(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
             memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
             guest_copy_flush();  // (cbuf copies shared within the submission are stale now)

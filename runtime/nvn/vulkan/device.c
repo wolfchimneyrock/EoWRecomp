@@ -265,6 +265,8 @@ static void create_device(void) {
     WANT(f12, h12, uniformAndStorageBuffer8BitAccess);
     WANT(f12, h12, storageBuffer8BitAccess);
     WANT(f12, h12, scalarBlockLayout);
+    f12.drawIndirectCount = h12.drawIndirectCount;  // (NVN's MultiDraw*IndirectCount: exec.c)
+    g_vk.draw_indirect_count = h12.drawIndirectCount;
     if (g_vk.ahb_import) {
         WANT(f12, h12, bufferDeviceAddress);
         g_vk.ahb_import = h12.bufferDeviceAddress;
@@ -294,6 +296,9 @@ static void create_device(void) {
     b->sampleRateShading = h->sampleRateShading;
     b->fragmentStoresAndAtomics = h->fragmentStoresAndAtomics;
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
+    b->multiDrawIndirect = h->multiDrawIndirect;
+    b->drawIndirectFirstInstance = h->drawIndirectFirstInstance;
+    g_vk.multi_draw_indirect = h->multiDrawIndirect;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
     b->shaderStorageImageWriteWithoutFormat = h->shaderStorageImageWriteWithoutFormat;  // (SUST: image format from the texture)
