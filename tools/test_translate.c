@@ -1,10 +1,17 @@
 // Fuzz test for the Maxwell shader translator (runtime/nvn/maxwell/translate.c).
 //
 //  1. MSL must not change: every program is translated by the current translate.c (key.glsl = 0) and by the
-//     reference MSL-only translator (an older translate.c compiled with old_* symbol names, see
-//     tools/test_translate.sh); the MSL text and all ShaderInfo fields must be identical.
-//  2. GLSL must compile: the same program with key.glsl = 1 is compiled in-process with shaderc (Vulkan 1.3) and
-//     the SPIR-V validated with SPIRV-Tools.
+//     reference translator (translate.c of REF compiled with old_* symbol names, see tools/test_translate.sh); the
+//     MSL text and the reference's ShaderInfo fields must be identical.
+//  2. GLSL must compile: the same program with key.glsl = 1 is written to <dump_dir>/glsl/<seed>_<n>.<vert|frag|comp>,
+//     which tools/test_translate.sh compiles with glslangValidator (Vulkan 1.3) and validates with spirv-val. (Out of
+//     process: the build machines have the tools, not the shaderc / SPIRV-Tools libraries.)
+//  3. TT_GLSL_REF=1: the GLSL text must also be identical to the reference's (the new switches off: TT_STRUCTURE=0
+//     TT_PUSH=0, TT_CB_VEC4 / TT_SINK_TEX unset).
+// The translator's switches: TT_STRUCTURE=0 / TT_PUSH=0 (structured shaders, c1 inlined + push constants: on by default,
+// as on Mali / Adreno), TT_CB_VEC4=1 (merged constant reads: Mali), TT_SINK_TEX=1, TT_GMEM_MIRROR=1 (no heap import:
+// the copies' table), and the translator's own EOWRECOMP_VK_*. Every program gets random compiler constants (c1:
+// inlined, BRX tables) and, for fragment shaders, a push base after a vertex shader's words.
 //
 // Programs are synthesized from the opcode patterns translate.c recognizes (every OPM(value, mask) and the
 // half-precision `(op & mask) == value` tests, read from the source file): the unmasked bits are random, with
@@ -19,15 +26,15 @@
 
 #include "../runtime/nvn/maxwell/shader.h"
 
-#ifdef WITH_GLSL
-#include <shaderc/shaderc.h>
-#include <spirv-tools/libspirv.h>
-#endif
+#include <stddef.h>
+#include <sys/stat.h>
 
 // the reference translator (same ShaderKey prefix and ShaderInfo layout)
 ShaderInfo *old_maxwell_translate(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key);
 void old_maxwell_free(ShaderInfo *s);
 extern uint64_t old_maxwell_gmem_base, old_maxwell_gmem_size;
+extern bool old_maxwell_gmem_mirror;
+void old_maxwell_set_cb1(const uint8_t *data, uint32_t size);
 
 static uint64_t rng_state, g_seed;
 static uint64_t rnd64(void) {  // splitmix64
@@ -190,12 +197,14 @@ static void gen_key(ShaderKey *k, int stage) {
     if (stage == STAGE_FRAGMENT && rnd(2)) k->vs_out_mask = (uint32_t)rnd64();
 }
 
-static bool same_info(const ShaderInfo *a, const ShaderInfo *b) {
+static bool same_info(const ShaderInfo *a, const ShaderInfo *b) {  // (b: the reference's - the fields up to error[])
     if ((a->msl == NULL) != (b->msl == NULL)) return false;
     if (a->msl && strcmp(a->msl, b->msl)) return false;
-    ShaderInfo x = *a, y = *b;
+    ShaderInfo x, y;
+    size_t n = offsetof(ShaderInfo, error) + sizeof x.error;
+    memcpy(&x, a, n), memcpy(&y, b, n);
     x.msl = y.msl = NULL;
-    return !memcmp(&x, &y, sizeof x);
+    return !memcmp(&x, &y, n);
 }
 
 static void dump(const char *dir, const char *tag, long n, const char *src, const char *err, const uint8_t *prog, size_t len) {
@@ -226,17 +235,18 @@ int main(int argc, char **argv) {
     maxwell_gmem_size = old_maxwell_gmem_size = 0x10000000ull;
     // TT_GMEM_MIRROR=1: every stage through the address table, no heap behind it (no host import: exec.c gmir_)
     maxwell_gmem_mirror = getenv("TT_GMEM_MIRROR") && atoi(getenv("TT_GMEM_MIRROR")) != 0;
-#ifdef WITH_GLSL
-    shaderc_compiler_t comp = shaderc_compiler_initialize();
-    shaderc_compile_options_t opt = shaderc_compile_options_initialize();
-    shaderc_compile_options_set_target_env(opt, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-    shaderc_compile_options_set_source_language(opt, shaderc_source_language_glsl);
-    spv_context spv = spvContextCreate(SPV_ENV_VULKAN_1_3);
-#else
-    if (do_glsl) { fprintf(stderr, "built without WITH_GLSL: msl mode only\n"); do_glsl = false; }
-#endif
+    char gdir[512] = "";
+    if (do_glsl && dir) { snprintf(gdir, sizeof gdir, "%s/glsl", dir); mkdir(gdir, 0755); }
+    old_maxwell_gmem_mirror = maxwell_gmem_mirror;
+    maxwell_glsl_structured = !(getenv("TT_STRUCTURE") && atoi(getenv("TT_STRUCTURE")) == 0);
+    maxwell_glsl_push = !(getenv("TT_PUSH") && atoi(getenv("TT_PUSH")) == 0);
+    maxwell_cb_vec4 = getenv("TT_CB_VEC4") && atoi(getenv("TT_CB_VEC4")) != 0;
+    maxwell_sink_tex = getenv("TT_SINK_TEX") && atoi(getenv("TT_SINK_TEX")) != 0;
+    bool glsl_ref = getenv("TT_GLSL_REF") && atoi(getenv("TT_GLSL_REF")) != 0;
+    static uint8_t consts[512];
     static uint8_t prog[0x80 + 64 * 32 + 128];
-    long msl_ok = 0, msl_fail = 0, msl_diff = 0, gl_ok = 0, gl_tfail = 0, gl_tfail_only = 0, gl_cfail = 0, gl_vfail = 0;
+    long msl_ok = 0, msl_fail = 0, msl_diff = 0, gl_ok = 0, gl_tfail = 0, gl_tfail_only = 0, gl_diff = 0;
+    long gl_pcloop = 0, gl_fwd = 0, gl_struct = 0, gl_push = 0;
     long by_stage[3] = {0};
     char reasons[64][96];
     long reason_n[64];
@@ -244,6 +254,8 @@ int main(int argc, char **argv) {
     for (long n = 0; n < count; n++) {
         int stage = rnd(3) == 0 ? STAGE_VERTEX : rnd(2) ? STAGE_FRAGMENT : STAGE_COMPUTE;
         size_t len = gen_program(prog, sizeof prog, stage);
+        for (size_t i = 0; i < sizeof consts; i++) consts[i] = (uint8_t)rnd64();
+        uint32_t csize = rnd(4) ? sizeof consts : 0;  // (c1; sometimes none)
         ShaderKey key;
         gen_key(&key, stage);
         bool msl_good = true;
@@ -259,10 +271,23 @@ int main(int argc, char **argv) {
             maxwell_free(a);
             old_maxwell_free(b);
         }
-#ifdef WITH_GLSL
         if (do_glsl) {
             key.glsl = 1;
+            maxwell_set_cb1(consts, csize);
+            maxwell_push_cap = rnd(4) ? 64 : 32;
+            maxwell_push_base = stage == STAGE_FRAGMENT ? 4 * rnd(17) : 0;  // (after a vertex shader's words)
             ShaderInfo *g = maxwell_translate(prog, len, stage, &key);
+            maxwell_set_cb1(NULL, 0);
+            if (glsl_ref) {
+                old_maxwell_set_cb1(consts, csize);
+                ShaderInfo *o = old_maxwell_translate(prog, len, stage, &key);
+                old_maxwell_set_cb1(NULL, 0);
+                if (!same_info(g, o)) {
+                    if (gl_diff < 20) dump(dir, "glsl_diff", n, g->msl, o->msl, prog, len);
+                    gl_diff++;
+                }
+                old_maxwell_free(o);
+            }
             if (!g->msl) {
                 gl_tfail++;
                 if (msl_good && do_msl) gl_tfail_only++;
@@ -276,40 +301,36 @@ int main(int argc, char **argv) {
                     if (i < 64) reason_n[i]++;
                 }
             } else {
-                shaderc_shader_kind kind = stage == STAGE_VERTEX ? shaderc_vertex_shader
-                                         : stage == STAGE_FRAGMENT ? shaderc_fragment_shader : shaderc_compute_shader;
-                shaderc_compilation_result_t res = shaderc_compile_into_spv(comp, g->msl, strlen(g->msl), kind, "fuzz", "main", opt);
-                if (shaderc_result_get_compilation_status(res) != shaderc_compilation_status_success) {
-                    if (gl_cfail < 50) dump(dir, "glsl_compile", n, g->msl, shaderc_result_get_error_message(res), prog, len);
-                    gl_cfail++;
-                } else {
-                    spv_diagnostic diag = NULL;
-                    spv_const_binary_t bin = {(const uint32_t *)shaderc_result_get_bytes(res), shaderc_result_get_length(res) / 4};
-                    spv_validator_options vo = spvValidatorOptionsCreate();
-                    spv_result_t vr = spvValidateWithOptions(spv, vo, &bin, &diag);
-                    spvValidatorOptionsDestroy(vo);
-                    if (vr != SPV_SUCCESS) {
-                        if (gl_vfail < 50) dump(dir, "glsl_validate", n, g->msl, diag ? diag->error : "?", prog, len);
-                        gl_vfail++;
-                    } else {
-                        gl_ok++;
-                        by_stage[stage == STAGE_VERTEX ? 0 : stage == STAGE_FRAGMENT ? 1 : 2]++;
-                        if (dir && gl_ok <= (getenv("TT_DUMP_OK") ? atol(getenv("TT_DUMP_OK")) : 40)) dump(dir, "glsl_ok", n, g->msl, NULL, prog, len);
+                gl_ok++;
+                by_stage[stage == STAGE_VERTEX ? 0 : stage == STAGE_FRAGMENT ? 1 : 2]++;
+                if (strstr(g->msl, "switch (pc)")) gl_pcloop++;
+                else if (strstr(g->msl, "uint pc = 8u;")) gl_fwd++;
+                else if (strstr(g->msl, "uint loops = 0u;")) gl_struct++;
+                if (g->npush) gl_push++;
+                if (*gdir) {
+                    char path[600];
+                    snprintf(path, sizeof path, "%s/%llu_%ld.%s", gdir, (unsigned long long)g_seed, n,
+                             stage == STAGE_VERTEX ? "vert" : stage == STAGE_FRAGMENT ? "frag" : "comp");
+                    FILE *f = fopen(path, "wb");
+                    if (f) {
+                        fprintf(f, "// program:");
+                        for (size_t i = 0; i < len; i += 8) fprintf(f, " %016llx", (unsigned long long)*(const uint64_t *)(prog + i));
+                        fprintf(f, "\n");
+                        fputs(g->msl, f), fclose(f);
                     }
-                    spvDiagnosticDestroy(diag);
                 }
-                shaderc_result_release(res);
             }
             maxwell_free(g);
         }
-#endif
     }
     if (do_msl) printf("MSL: %ld programs, %ld translated, %ld failed in both, %ld DIFFERENCES\n", count, msl_ok, msl_fail, msl_diff);
     if (do_glsl) {
-        printf("GLSL: %ld compiled+validated (vs %ld / fs %ld / cs %ld), %ld compile failures, %ld validation failures, "
-               "%ld translation failures (%ld where MSL translated)\n",
-               gl_ok, by_stage[0], by_stage[1], by_stage[2], gl_cfail, gl_vfail, gl_tfail, gl_tfail_only);
+        printf("GLSL: %ld translated (vs %ld / fs %ld / cs %ld; %ld with the pc loop, %ld FWD blocks, %ld structured, %ld with "
+               "push constants), %ld translation failures (%ld where MSL translated)%s",
+               gl_ok, by_stage[0], by_stage[1], by_stage[2], gl_pcloop, gl_fwd, gl_struct, gl_push, gl_tfail, gl_tfail_only,
+               glsl_ref ? "" : "\n");
+        if (glsl_ref) printf(", %ld GLSL DIFFERENCES from the reference\n", gl_diff);
         for (int i = 0; i < nreasons; i++) printf("  translation failure: %-36s %ld\n", reasons[i], reason_n[i]);
     }
-    return (msl_diff || gl_cfail || gl_vfail) ? 1 : 0;
+    return (msl_diff || gl_diff) ? 1 : 0;
 }
