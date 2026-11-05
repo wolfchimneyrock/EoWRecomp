@@ -1901,9 +1901,9 @@ static const char *glsl_sampler_type(const ShaderTexture *t) {
 // Declarations + entry point around the (rewritten) body; mirrors the MSL assembly in maxwell_translate.
 // A heap larger than one storage buffer reaches (Mali-G610 / libmali: 2 GB; this game's heap is larger): every
 // gmem_.w[i] of the body goes through two windows - gmem_ for words below GMEM_LO_WORDS, gmemh_ (from word
-// maxwell_gmem_hi_word on) above. Reads become gmr_(i), stores gmw_(i, v), atomics GMA_(op, i, v). The body only
+// maxwell_gmem_hi_word on) above. Reads become gmr_(i), stores gmw_(i, v), atomics a ternary of the two. The body only
 // uses the forms the emitters above write: "gmem_.w[i]" read, "gmem_.w[i] = v;" store, "atomicXxx(gmem_.w[i], v)".
-static char *gmem_split(const char *src) {
+static char *gmem_split(const char *src, uint32_t hi_word) {
     static const char key[] = "gmem_.w[";
     Str o = {0};
     const char *p = src;
@@ -1928,10 +1928,16 @@ static char *gmem_split(const char *src) {
         }
         const char *after = x + 1;
         while (*after == ' ') after++;
-        if (atomic) {  // atomicXxx(gmem_.w[i], v) -> GMA_(atomicXxx, (i), v)
+        if (atomic) {  // atomicXxx(gmem_.w[i], args) -> (i < LO ? atomicXxx(gmem_.w[i], args) : atomicXxx(gmemh_.w[i - HI], args))
+            const char *r = x + 1;  // the call's other arguments, up to its closing parenthesis
+            int d2 = 1;
+            while (*r && d2) { if (*r == '(') d2++; else if (*r == ')') d2--; if (d2) r++; }
+            if (!*r) { sp(&o, "%s", p); break; }
+            int fl = (int)(a - 1 - fn), al = (int)(r - (x + 1));
             sp(&o, "%.*s", (int)(fn - p), p);
-            sp(&o, "GMA_(%.*s, (%.*s)", (int)(a - 1 - fn), fn, ilen, e);
-            p = x + 1;
+            sp(&o, "((%.*s) < 0x%xu ? %.*s(gmem_.w[%.*s]%.*s) : %.*s(gmemh_.w[(%.*s) - 0x%xu]%.*s))", ilen, e, GMEM_LO_WORDS,
+               fl, fn, ilen, e, al, x + 1, fl, fn, ilen, e, hi_word, al, x + 1);
+            p = r + 1;
         } else if (after[0] == '=' && after[1] != '=') {  // gmem_.w[i] = v; -> gmw_(i, v);
             const char *v = after + 1, *end = strchr(v, ';');
             if (!end) { sp(&o, "%s", p); break; }
@@ -1954,7 +1960,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     Str body = {0};
     glsl_rewrite(c, &body, c->body.buf ? c->body.buf : "");
     uint32_t hi_word = info->uses_gmem ? maxwell_gmem_hi_word : 0;
-    if (hi_word && body.buf) { char *b2 = gmem_split(body.buf); free(body.buf); body.buf = b2; }
+    if (hi_word && body.buf) { char *b2 = gmem_split(body.buf, hi_word); free(body.buf); body.buf = b2; }
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
     if (info->cbuf_mask >> 18) fail(c, "cbuf index out of range");
     for (int i = 0; i < info->ntex; i++)
@@ -1981,7 +1987,6 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "uint gmr_(uint i) { return i < 0x%xu ? gmem_.w[i] : gmemh_.w[i - 0x%xu]; }\n", GMEM_LO_WORDS, hi_word);
         if (c->uses_gmem_store)
             sp(&s, "void gmw_(uint i, uint v) { if (i < 0x%xu) gmem_.w[i] = v; else gmemh_.w[i - 0x%xu] = v; }\n", GMEM_LO_WORDS, hi_word);
-        sp(&s, "#define GMA_(op, i, v) ((i) < 0x%xu ? op(gmem_.w[i], v) : op(gmemh_.w[(i) - 0x%xu], v))\n", GMEM_LO_WORDS, hi_word);
     }
     if (info->uses_gmem_map) {  // (compute) the dispatch's storage buffers, device-local: gmap[i] = heap offset, size, word
         sp(&s, "layout(std140, set = %d, binding = %d) uniform GMap { uvec4 gmap[%d]; };\n", set, GMAP_BUFFER_INDEX, GMAP_MAX + 1);
