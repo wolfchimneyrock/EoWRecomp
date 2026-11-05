@@ -128,9 +128,73 @@ static bool opt_stage(int stage) {
     return getenv("EOWRECOMP_VK_OPT") || (on && stage != STAGE_VERTEX);
 }
 
+// Vertex shaders optimised safely (from LAS Recomp's mali-opt2): compiled at -O0, every float operation marked
+// NoContraction (no_contraction), and only then through spirv-opt (SPIRV-Tools' C API, exported by libshaderc_shared).
+// spirv-opt folds / reassociates no float math carrying NoContraction, so the depth pre-pass and colour pass keep
+// bit-identical positions; what goes is the -O0 bulk (guest registers as function variables, the pc loop) that
+// Mali's compiler is slow with. (shaderc's own -O ran before no_contraction: that is what broke the EQUAL test.)
+// EOWRECOMP_VK_OPT_VS=1: on.
+typedef struct spv_optimizer_t spv_optimizer_t;
+typedef struct spv_optimizer_options_t *spv_optimizer_options;
+typedef struct { uint32_t *code; size_t wordCount; } spv_binary_t;
+typedef struct { size_t line, column, index; } spv_position_t;
+extern spv_optimizer_t *spvOptimizerCreate(int env);
+extern void spvOptimizerDestroy(spv_optimizer_t *);
+extern void spvOptimizerSetMessageConsumer(spv_optimizer_t *, void (*)(int, const char *, const spv_position_t *, const char *));
+extern void spvOptimizerRegisterPerformancePasses(spv_optimizer_t *);
+extern int spvOptimizerRun(spv_optimizer_t *, const uint32_t *, size_t, spv_binary_t **, spv_optimizer_options);
+extern spv_optimizer_options spvOptimizerOptionsCreate(void);
+extern void spvOptimizerOptionsDestroy(spv_optimizer_options);
+extern void spvOptimizerOptionsSetRunValidator(spv_optimizer_options, bool);
+extern void spvBinaryDestroy(spv_binary_t *);
+extern int spvParseTargetEnv(const char *, int *);
+
+static void spvopt_msg(int level, const char *src, const spv_position_t *pos, const char *msg) {
+    (void)src; (void)pos;
+    static int n;
+    if (level <= 2 && n++ < 10) LOG("[vk] spirv-opt: %s\n", msg);  // (fatal / internal error / error)
+}
+
+static bool opt_vertex(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("EOWRECOMP_VK_OPT_VS");
+        on = e && atoi(e) != 0;
+        if (on) LOG("[vk] vertex shaders optimised after NoContraction (EOWRECOMP_VK_OPT_VS)\n");
+    }
+    return on;
+}
+
+static uint32_t *spvopt(uint32_t *spv, size_t *nwords) {
+    int env = 0;
+    if (spvParseTargetEnv("vulkan1.3", &env) != 0) return spv;
+    spv_optimizer_t *o = spvOptimizerCreate(env);
+    if (!o) return spv;
+    spvOptimizerSetMessageConsumer(o, spvopt_msg);
+    spvOptimizerRegisterPerformancePasses(o);
+    spv_optimizer_options oo = spvOptimizerOptionsCreate();
+    spvOptimizerOptionsSetRunValidator(oo, false);  // (the driver is the judge: NoContraction on Fma etc.)
+    spv_binary_t *b = NULL;
+    if (spvOptimizerRun(o, spv, *nwords, &b, oo) == 0 && b && b->code && b->wordCount > 5) {
+        uint32_t *out = malloc(b->wordCount * 4);
+        memcpy(out, b->code, b->wordCount * 4);
+        *nwords = b->wordCount;
+        free(spv);
+        spv = out;
+    } else {
+        static int n;
+        if (n++ < 10) LOG("[vk] spirv-opt failed on a vertex shader: kept at -O0\n");
+    }
+    if (b) spvBinaryDestroy(b);
+    spvOptimizerOptionsDestroy(oo);
+    spvOptimizerDestroy(o);
+    return spv;
+}
+
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
     bool optimized = opt_stage(stage);
-    uint64_t h = src_hash(src, stage) ^ (optimized ? 0x9e3779b97f4a7c15ull : 0);
+    bool optvs = !optimized && stage == STAGE_VERTEX && opt_vertex();
+    uint64_t h = src_hash(src, stage) ^ (optimized ? 0x9e3779b97f4a7c15ull : 0) ^ (optvs ? 0x5851f42d4c957f2dull : 0);
     static int nocache = -1;
     if (nocache < 0) nocache = getenv("EOWRECOMP_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
@@ -152,6 +216,7 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
         memcpy(out, shaderc_result_get_bytes(r), n);
         *nwords = n / 4;
         if (stage == STAGE_VERTEX) out = no_contraction(out, nwords);
+        if (optvs) out = spvopt(out, nwords);
         if (!nocache) cache_store(h, out, *nwords);
     }
     shaderc_result_release(r);
