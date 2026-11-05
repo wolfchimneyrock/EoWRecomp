@@ -1972,7 +1972,18 @@ static void build_pipeline(void *arg) {
     }
     uint64_t t0 = SDL_GetTicksNS();
     job_begin("pipeline vs %llx fs %llx", (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
-    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+    extern bool g_shader_stats;
+    extern _Thread_local char g_stats_label[128];
+    extern void vk_pipeline_stats(VkPipeline p);
+    if (g_shader_stats) {  // (EOWRECOMP_VK_SHADER_STATS: the shaders by code address and the fs hash the GPU profile shows)
+        uint64_t fa = k->prog->code[1];
+        uint64_t fh = fa ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fa + 0x30), 0x200) : 0;
+        snprintf(g_stats_label, sizeof g_stats_label, "vs %llx fs %llx fsh %016llx", (unsigned long long)k->prog->code[0],
+                 (unsigned long long)fa, (unsigned long long)fh);
+        pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_shader_stats ? VK_NULL_HANDLE : g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+    if (g_shader_stats && r == VK_SUCCESS) vk_pipeline_stats(pp->pipe);
     job_end();
     uint64_t dt = SDL_GetTicksNS() - t0;
     atomic_fetch_add(&stat_pipe_ns, dt);
@@ -3703,7 +3714,15 @@ static void build_compute(void *arg) {
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
-    VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    extern bool g_shader_stats;
+    extern _Thread_local char g_stats_label[128];
+    extern void vk_pipeline_stats(VkPipeline p);
+    if (g_shader_stats) {
+        snprintf(g_stats_label, sizeof g_stats_label, "cs %llx", (unsigned long long)cp->p.code[0]);
+        ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    VkResult r = vkCreateComputePipelines(g_vk.dev, g_shader_stats ? VK_NULL_HANDLE : g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    if (g_shader_stats && r == VK_SUCCESS) vk_pipeline_stats(cp->pipe);
     atomic_fetch_add(&stat_compiles, 1);
     job_end();
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
@@ -3719,6 +3738,7 @@ static CsProg *compute_program(NvnProgram *np) {
     int n = g_cs_n;
     for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr) return tab[i].cp;
     CsProg *cp = calloc(1, sizeof *cp);
+    cp->p.code[0] = ss->code_addr;  // (EOWRECOMP_VK_SHADER_STATS' label)
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
