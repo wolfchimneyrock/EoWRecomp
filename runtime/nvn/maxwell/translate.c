@@ -28,6 +28,8 @@ bool maxwell_native_half;  // shader.h
 uint32_t maxwell_gmem_hi_word;  // shader.h
 bool maxwell_gmem_mirror;       // shader.h
 bool maxwell_glsl_structured;   // shader.h: static stacks + structured control flow (exec.c: Mali, Adreno)
+bool maxwell_glsl_push;         // shader.h: c1 inlined + push constants (exec.c: Mali, Adreno)
+_Thread_local uint32_t maxwell_push_base, maxwell_push_cap = 64;  // shader.h (per translating thread)
 // Iteration limit of a branching shader's dispatch loop (a mistranslated branch can't hang the GPU forever).
 // EOWRECOMP_SHADER_GUARD overrides it (backends read it): a small one shows which shaders loop.
 uint32_t maxwell_loop_guard = 100000;
@@ -153,6 +155,18 @@ static const char *pred(Ctx *c, int p, bool neg, char *buf) {
 #define P(p, n) pred(c, (p), (n), alloca(16))
 
 static const char *cbuf_ref(Ctx *c, int idx, int64_t off, const char *dyn, char *buf) {
+    // c1, statically indexed (GLSL, EOWRECOMP_VK_INLINE_C1=1; default maxwell_glsl_push): the shader's own compiler
+    // constants never change, so the value itself instead of a uniform buffer load - which on Mesa's PanVK is a memory
+    // load every time (it keeps no uniform buffer words in the fast uniform registers, unlike Arm's driver), in the
+    // light loops too. (From LAS Recomp #563.)
+    static int inl = -1;
+    if (inl < 0) { const char *e = getenv("EOWRECOMP_VK_INLINE_C1"); inl = e ? atoi(e) != 0 : maxwell_glsl_push; }
+    if (inl && c->glsl && idx == 1 && !dyn && maxwell_cb1 && off >= 0 && (off & 3) == 0 && off + 4 <= (int64_t)maxwell_cb1_size) {
+        uint32_t v;
+        memcpy(&v, maxwell_cb1 + off, 4);
+        sprintf(buf, "0x%08xu", v);
+        return buf;
+    }
     c->info->cbuf_mask |= 1u << idx;
     if (off + 16 > (int64_t)c->info->cbuf_size[idx]) c->info->cbuf_size[idx] = (uint32_t)((off + 16 + 255) & ~255);
     if (dyn) c->info->cbuf_dynamic |= 1u << idx;
@@ -2196,12 +2210,93 @@ static char *gmem_split(const char *src, uint32_t hi_word) {
     return o.buf;
 }
 
+// EOWRECOMP_VK_PUSH_CB (vertex and fragment; default maxwell_glsl_push: Mali, Adreno): the constant buffer words read
+// most (statically indexed, cbufs 3+: the game's own) move into push constants: fast uniform registers instead of a
+// uniform buffer load each (Mesa's PanVK keeps no uniform buffer words in fast uniforms; Turnip loads them in a per-draw
+// preamble that push constants shorten). A read's weight is how often it may run: x8 per enclosing loop (do / for),
+// x1/2 per enclosing if / else (predicated instructions included). The vertex shader takes up to 16 words from push
+// offset 0, the fragment shader the rest of the budget after it: the caller sets maxwell_push_base / maxwell_push_cap
+// (this thread's) around each translation, the budget within the device's maxPushConstantsSize. (From LAS Recomp #563.)
+// EOWRECOMP_VK_PUSH_VS=0: none in vertex shaders.
+static void push_promote(Ctx *c, Str *body) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("EOWRECOMP_VK_PUSH_CB"); on = e ? atoi(e) != 0 : maxwell_glsl_push; }
+    if (!on || (c->stage != STAGE_FRAGMENT && c->stage != STAGE_VERTEX) || !body->buf) return;
+    static int vs_on = -1;
+    if (vs_on < 0) { const char *e = getenv("EOWRECOMP_VK_PUSH_VS"); vs_on = !e || atoi(e); }
+    if (c->stage == STAGE_VERTEX && !vs_on) return;
+    int vs_cap = (int)maxwell_push_cap < 32 ? (int)maxwell_push_cap / 2 : 16;  // (the vertex shader's share of the budget)
+    int cap = c->stage == STAGE_VERTEX ? vs_cap : (int)maxwell_push_cap - (vs_on ? (int)maxwell_push_base / 4 : vs_cap);
+    if (cap > 64) cap = 64;
+    if (cap <= 0) return;
+    enum { MAXW = 512, MAXD = 64 };
+    typedef struct { uint8_t cb; uint16_t off; double w; } PushWord;
+    PushWord words[MAXW];
+    char scope[MAXD];  // 'l' loop, 'c' if / else, '-' other
+    int nw = 0, nd = 0, loops = 0, conds = 0;
+    const char *b = body->buf, *line = b;
+    for (const char *p = b; *p; p++) {
+        if (*p == '\n') line = p + 1;
+        if (*p == '{') {
+            char k = '-';
+            const char *q = p;  // (what opens it: "do {", "for (...) {", "if (...) {", "else {")
+            while (q > line && (q[-1] == ' ')) q--;
+            const char *fo = strstr(line, "for (");
+            if (q - line >= 2 && !strncmp(q - 2, "do", 2)) k = 'l';
+            else if (fo && fo < p) k = 'l';
+            else if (strstr(line, "if (") && strstr(line, "if (") < p) k = 'c';
+            else if (q - line >= 4 && !strncmp(q - 4, "else", 4)) k = 'c';
+            if (nd < MAXD) scope[nd] = k;
+            nd++;
+            if (k == 'l') loops++; else if (k == 'c') conds++;
+            continue;
+        }
+        if (*p == '}') {
+            if (nd > 0) { nd--; if (nd < MAXD) { if (scope[nd] == 'l') loops--; else if (scope[nd] == 'c') conds--; } }
+            continue;
+        }
+        int cb, row, col, len = 0;
+        if (p[0] == 'c' && p[1] == 'b' && (p == b || !((p[-1] >= 'a' && p[-1] <= 'z') || (p[-1] >= '0' && p[-1] <= '9') || p[-1] == '_')) &&
+            sscanf(p, "cb%d[%d][%d]%n", &cb, &row, &col, &len) == 3 && len && cb >= 3 && cb < 18 && col < 4 && row < 4096) {
+            uint16_t off = (uint16_t)(row * 16 + col * 4);
+            double w = 1;
+            for (int d = 0; d < loops && d < 6; d++) w *= 8;
+            for (int d = 0; d < conds && d < 6; d++) w *= 0.5;
+            int i = 0;
+            while (i < nw && !(words[i].cb == cb && words[i].off == off)) i++;
+            if (i == nw && nw < MAXW) words[nw++] = (PushWord){(uint8_t)cb, off, 0};
+            if (i < nw) words[i].w += w;
+            p += len - 1;
+        }
+    }
+    if (!nw) return;
+    for (int i = 1; i < nw; i++)  // (by weight, heaviest first)
+        for (int j = i; j > 0 && words[j].w > words[j - 1].w; j--) { PushWord t = words[j]; words[j] = words[j - 1]; words[j - 1] = t; }
+    int n = nw < cap ? nw : cap;
+    Str o = {0};
+    for (const char *p = b; *p;) {
+        int cb, row, col, len = 0, k = -1;
+        if (p[0] == 'c' && p[1] == 'b' && (p == b || !((p[-1] >= 'a' && p[-1] <= 'z') || (p[-1] >= '0' && p[-1] <= '9') || p[-1] == '_')) &&
+            sscanf(p, "cb%d[%d][%d]%n", &cb, &row, &col, &len) == 3 && len) {
+            for (int i = 0; i < n; i++) if (words[i].cb == cb && words[i].off == row * 16 + col * 4) { k = i; break; }
+        }
+        if (k >= 0) { sp(&o, "pcw[%d]", k); p += len; }
+        else { sp(&o, "%c", *p); p++; }
+    }
+    free(body->buf);
+    *body = o;
+    c->info->npush = (uint8_t)n;
+    c->info->push_base = c->stage == STAGE_VERTEX ? 0 : (uint16_t)maxwell_push_base;
+    for (int i = 0; i < n; i++) c->info->push_cb[i] = words[i].cb, c->info->push_off[i] = words[i].off;
+}
+
 static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     ShaderInfo *info = c->info;
     const ShaderKey *key = c->key;
     int stage = c->stage;
     Str body = {0};
     glsl_rewrite(c, &body, c->body.buf ? c->body.buf : "");
+    push_promote(c, &body);
     uint32_t hi_word = info->uses_gmem ? maxwell_gmem_hi_word : 0;
     if (hi_word && body.buf) { char *b2 = gmem_split(body.buf, hi_word); free(body.buf); body.buf = b2; }
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
@@ -2221,6 +2316,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (!n) n = 1;
         sp(&s, "layout(std140, set = %d, binding = %d) uniform CB%d { uvec4 cb%d[%u]; };\n", set, i, i, i, n);
     }
+    if (info->npush)  // (push_promote)
+        sp(&s, "layout(push_constant) uniform PC { layout(offset = %u) uint pcw[%d]; };\n", info->push_base, info->npush);
     if (info->uses_gmem && !maxwell_gmem_mirror)  // (copies: no heap buffer, everything goes through the table)
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");

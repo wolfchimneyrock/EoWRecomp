@@ -1113,6 +1113,15 @@ void vk_exec_init(void) {
     const char *se = getenv("EOWRECOMP_VK_STRUCTURE");
     LOG("[vk] structured shaders %s (%s)\n", (se ? atoi(se) != 0 : maxwell_glsl_structured) ? "on" : "off",
         se ? "EOWRECOMP_VK_STRUCTURE" : "default for this GPU");
+    // c1 inlined and the hot constant buffer words as push constants by default on Mali and Adreno (LAS Recomp #563 /
+    // #579). Mesa's PanVK reads constant buffers from memory every time; Turnip loads them into its constant file in a
+    // per-draw preamble, which push constants shorten (LAS's field main pass on an Adreno 643: 7.52 -> 6.66 ms).
+    // EOWRECOMP_VK_INLINE_C1 / EOWRECOMP_VK_PUSH_CB =1 / =0 override.
+    maxwell_glsl_push = g_vk.props.vendorID == 0x13B5 || g_vk.props.vendorID == 0x5143;
+    const char *pe = getenv("EOWRECOMP_VK_PUSH_CB");
+    LOG("[vk] constant-buffer push constants %s (%s, %u bytes of push constants)\n",
+        (pe ? atoi(pe) != 0 : maxwell_glsl_push) ? "on" : "off", pe ? "EOWRECOMP_VK_PUSH_CB" : "default for this GPU",
+        g_vk.props.limits.maxPushConstantsSize);
 }
 
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy);
@@ -1510,8 +1519,15 @@ static void warm_init(void);
 static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, VkShaderStageFlags s1) {
     p->set_layout[0] = vk_set_layout(p->binds, p->nbinds, 0, s0);
     if (nsets > 1) p->set_layout[1] = vk_set_layout(p->binds, p->nbinds, 1, s1);
+    // (EOWRECOMP_VK_PUSH_CB: the shaders' promoted constant buffer words, ShaderInfo.npush: vertex from 0, fragment after)
+    VkPushConstantRange pcr[2];
+    uint32_t npcr = 0;
+    if (nsets > 1 && p->vi && p->vi->npush) pcr[npcr++] = (VkPushConstantRange){VK_SHADER_STAGE_VERTEX_BIT, 0, p->vi->npush * 4u};
+    if (nsets > 1 && p->fi && p->fi->npush)
+        pcr[npcr++] = (VkPushConstantRange){VK_SHADER_STAGE_FRAGMENT_BIT, p->fi->push_base, p->fi->npush * 4u};
     VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = (uint32_t)nsets,
-                                     .pSetLayouts = p->set_layout};
+                                     .pSetLayouts = p->set_layout, .pushConstantRangeCount = npcr,
+                                     .pPushConstantRanges = npcr ? pcr : NULL};
     VkPipelineLayout l;
     VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l));
     return l;
@@ -1605,10 +1621,15 @@ static void translate_program(void *arg) {
     const uint8_t *src0 = p->src[0] ? p->src[0] : (const uint8_t *)(uintptr_t)p->code[0];
     const uint8_t *src1 = p->src[1] ? p->src[1] : (const uint8_t *)(uintptr_t)p->code[1];
     maxwell_set_cb1(src0 + p->cmax[0], p->csize[0]);
+    // (EOWRECOMP_VK_PUSH_CB: the vertex shader's words first; vertex and fragment together within the device's limit,
+    // which Vulkan only guarantees at 128 bytes, and at most 64 words. This thread's: translations run in parallel)
+    uint32_t pc_words = g_vk.props.limits.maxPushConstantsSize / 4;
+    maxwell_push_base = 0, maxwell_push_cap = pc_words < 64 ? pc_words : 64;
     p->vi = maxwell_translate(src0, p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
         maxwell_set_cb1(src1 + p->cmax[1], p->csize[1]);
+        maxwell_push_base = p->vi->npush * 4u;  // (the fragment shader's words after them)
         p->fi = maxwell_translate(src1, p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
     maxwell_set_cb1(NULL, 0);
@@ -4152,6 +4173,18 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);  // (always new sets)
+    for (int sg = 0; sg < 2; sg++) {  // (EOWRECOMP_VK_PUSH_CB) the promoted words, from the bound ranges as the draw sees them now
+        const ShaderInfo *si = sg ? pr->fi : pr->vi;
+        if (!si->npush) continue;
+        uint32_t pw[64];
+        for (int i = 0; i < si->npush; i++) {
+            Range rg = st.ubuf[sg][si->push_cb[i] - 3];  // (the shader's cbuf k is the game's binding k - 3: cbuf_info)
+            uint32_t o = si->push_off[i];
+            pw[i] = rg.addr && o + 4 <= (rg.size ? rg.size : 0x10000) ? *(const uint32_t *)(uintptr_t)(rg.addr + o) : 0;
+        }
+        vkCmdPushConstants(cb, pr->layout, sg ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT, si->push_base,
+                           si->npush * 4u, pw);
+    }
     if (pr->vi->uses_gmem_store) { vc_mark_sbufs(0); gw_note_sbufs(0); }
     if (pr->fi->uses_gmem_store) { vc_mark_sbufs(1); gw_note_sbufs(1); }
     if (dl_on >= 3)
