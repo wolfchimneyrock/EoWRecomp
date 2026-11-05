@@ -1105,6 +1105,14 @@ void vk_exec_init(void) {
         if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &prof_qp) != VK_SUCCESS) prof_qp = VK_NULL_HANDLE;
     }
     st_defaults();
+    // Structured shaders (static branch stacks + goto elimination instead of the pc state machine / FWD blocks,
+    // translate.c) by default where LAS Recomp measured them: Mali (Arm's driver, Mesa's PanVK) and Adreno (Turnip).
+    // EOWRECOMP_VK_STATIC_STACKS=1 EOWRECOMP_VK_STRUCTURE=1 turn them on elsewhere, =0 off anywhere. The SPIR-V cache
+    // keys on the GLSL text, so either form's translations are kept apart.
+    maxwell_glsl_structured = g_vk.props.vendorID == 0x13B5 || g_vk.props.vendorID == 0x5143;  // (Arm, Qualcomm)
+    const char *se = getenv("EOWRECOMP_VK_STRUCTURE");
+    LOG("[vk] structured shaders %s (%s)\n", (se ? atoi(se) != 0 : maxwell_glsl_structured) ? "on" : "off",
+        se ? "EOWRECOMP_VK_STRUCTURE" : "default for this GPU");
 }
 
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy);

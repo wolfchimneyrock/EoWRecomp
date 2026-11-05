@@ -103,6 +103,10 @@ extern uint32_t maxwell_gmem_hi_word;  // 0: one heap buffer; else the word wher
 // the guest memory they cover (vulkan/exec.c gmir_). There is no heap buffer (gmem_) then: accesses outside the table
 // read 0 and drop their stores. Set once before the first translation, never changed after (read by every thread).
 extern bool maxwell_gmem_mirror;
+// (GLSL) Structured shaders: the branch stacks resolved at translation and the branches as nested if / else /
+// do-while (goto elimination) instead of the pc state machine or the FWD blocks. The backend's default for this GPU
+// (exec.c: Mali, Adreno); EOWRECOMP_VK_STATIC_STACKS / EOWRECOMP_VK_STRUCTURE =1 / =0 override.
+extern bool maxwell_glsl_structured;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;
