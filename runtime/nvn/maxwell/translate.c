@@ -87,6 +87,7 @@ typedef struct {
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
+    int stack_push[3];       // GLSL: SSY / PBK / PCNT push sites (sizes the branch stacks: glsl_stacks)
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -955,19 +956,24 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sp(&c->body, c->fwd ? "    pc = %uu; break;\n" : "    pc = %uu; continue;\n", target);
     } else if (OPM(0xe290000000000000ull, 0xfff0000000000020ull)) {  // SSY
         c->uses_branches = true;
-        sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        c->stack_push[0]++;
+        sp(&c->body, c->glsl ? "    SSY_PUSH(%uu);\n" : "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xe2a0000000000000ull, 0xfff0000000000020ull)) {  // PBK
         c->uses_branches = true;
-        sp(&c->body, "    pbk[pbk_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        c->stack_push[1]++;
+        sp(&c->body, c->glsl ? "    PBK_PUSH(%uu);\n" : "    pbk[pbk_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xe2b0000000000000ull, 0xfff0000000000020ull)) {  // PCNT
         c->uses_branches = true;
-        sp(&c->body, "    pcnt[pcnt_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        c->stack_push[2]++;
+        sp(&c->body, c->glsl ? "    PCNT_PUSH(%uu);\n" : "    pcnt[pcnt_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull)) {  // SYNC
-        sp(&c->body, c->fwd ? "    pc = ssy[--ssy_n]; break;\n" : "    pc = ssy[--ssy_n]; continue;\n");
+        if (c->glsl) sp(&c->body, c->fwd ? "    pc = SSY_POP(); break;\n" : "    pc = SSY_POP(); continue;\n");
+        else sp(&c->body, c->fwd ? "    pc = ssy[--ssy_n]; break;\n" : "    pc = ssy[--ssy_n]; continue;\n");
     } else if (OPM(0xe340000000000000ull, 0xfff0000000000000ull)) {  // BRK
-        sp(&c->body, c->fwd ? "    pc = pbk[--pbk_n]; break;\n" : "    pc = pbk[--pbk_n]; continue;\n");
+        if (c->glsl) sp(&c->body, c->fwd ? "    pc = PBK_POP(); break;\n" : "    pc = PBK_POP(); continue;\n");
+        else sp(&c->body, c->fwd ? "    pc = pbk[--pbk_n]; break;\n" : "    pc = pbk[--pbk_n]; continue;\n");
     } else if (OPM(0xe350000000000000ull, 0xfff0000000000000ull)) {  // CONT
-        sp(&c->body, "    pc = pcnt[pcnt_n - 1]; continue;\n");
+        sp(&c->body, c->glsl ? "    pc = PCNT_PEEK(); continue;\n" : "    pc = pcnt[pcnt_n - 1]; continue;\n");
     } else if (OPM(0xf0f0000000000000ull, 0xfff8000000000000ull) || OPM(0x50b0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0xef98000000000000ull, 0xfff8000000000000ull)) {
         // DEPBAR / NOP / MEMBAR
@@ -2017,6 +2023,38 @@ static const char *glsl_sampler_type(const ShaderTexture *t) {
 }
 
 // Declarations + entry point around the (rewritten) body; mirrors the MSL assembly in maxwell_translate.
+// The SSY / PBK / PCNT branch stacks (GLSL; from LAS Recomp's mali-opt2). Dynamically indexed function-scope arrays
+// are what GPU compilers handle worst: nothing promotes them to registers. The translated code is structured - every
+// push is matched by its pop - so a stack never holds more entries than the program has push sites for it: with one
+// site it is a plain variable, with up to 4 a few variables picked by the depth, beyond that the array.
+// EOWRECOMP_VK_SCALAR_STACKS=1: on (default off).
+static void glsl_stacks(Ctx *c, Str *s) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("EOWRECOMP_VK_SCALAR_STACKS"); on = e && atoi(e) != 0; }
+    bool scalar = on;
+    static const char *const nm[3] = {"ssy", "pbk", "pcnt"}, *const up[3] = {"SSY", "PBK", "PCNT"};
+    for (int k = 0; k < 3; k++) {
+        int n = c->stack_push[k];
+        const char *a = nm[k], *A = up[k];
+        if (scalar && n <= 1) {
+            sp(s, "  uint %s0 = 0u;\n#define %s_PUSH(x) %s0 = (x)\n#define %s_POP() %s0\n#define %s_PEEK() %s0\n", a, A, a, A, a, A, a);
+        } else if (scalar && n <= 4) {
+            sp(s, "  uint %s_n = 0u", a);
+            for (int i = 0; i < n; i++) sp(s, ", %s%d = 0u", a, i);
+            sp(s, ";\n#define %s_PUSH(x) { uint v_ = (x); ", A);
+            for (int i = 0; i < n; i++) sp(s, i < n - 1 ? "if (%s_n == %du) %s%d = v_; else " : "%s%d = v_; ", a, i, a, i);
+            sp(s, "%s_n++; }\n#define %s_POP() (--%s_n == 0u ? %s0", a, A, a, a);
+            for (int i = 1; i < n; i++) sp(s, i < n - 1 ? " : %s_n == %du ? %s%d" : " : %s%d", a, i, a, i);
+            sp(s, ")\n#define %s_PEEK() (%s_n <= 1u ? %s0", A, a, a);
+            for (int i = 1; i < n; i++) sp(s, i < n - 1 ? " : %s_n == %du ? %s%d" : " : %s%d", a, i + 1, a, i);
+            sp(s, ")\n");
+        } else {
+            sp(s, "  uint %s[16]; uint %s_n = 0u;\n#define %s_PUSH(x) %s[%s_n++] = (x)\n#define %s_POP() %s[--%s_n]\n"
+                  "#define %s_PEEK() %s[%s_n - 1u]\n", a, a, A, a, a, A, a, a, A, a, a);
+        }
+    }
+}
+
 // A heap larger than one storage buffer reaches (Mali-G610 / libmali: 2 GB; this game's heap is larger): every
 // gmw(i) of the body goes through two windows - gmem_ for words below GMEM_LO_WORDS, gmemh_ (from word
 // maxwell_gmem_hi_word on) above. Reads become gmr_(i), stores gmw_(i, v), atomics a ternary of the two. The body only
@@ -2199,7 +2237,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
-        sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
+        sp(&s, "  uint pc = 8u;\n");
+        glsl_stacks(c, &s);
         sp(&s, "  bool exit_now = false;\n");
         if (c->fwd) {
             sp(&s, "%s", body.buf ? body.buf : "");
