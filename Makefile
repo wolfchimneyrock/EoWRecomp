@@ -45,7 +45,8 @@ CXX      := $(ZIG) c++ -target x86_64-windows-gnu
 GENARCH  ?= -mcpu=x86_64_v3  # (zig's spelling of x86-64-v3)
 endif
 IMGUI    := third_party/imgui
-GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
+GENOPT   ?= -O1
+GENFLAGS := $(GENOPT) -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime
 # FNPROF=1: game code with the function-entry profiler's hook (EOWRECOMP_FNPROF; runtime/cpu.h FN_ENTER)
 GENFLAGS += $(if $(FNPROF),-DEOWRECOMP_FNPROF)
 
@@ -100,6 +101,9 @@ EXE      := $(B)/eowrecomp
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
 ifeq ($(ARCH),x86_64)
 GENARCH  ?= -march=x86-64-v3  # as on Windows: AVX2 + FMA for the lifted FP/SIMD code (checked at startup)
+endif
+ifeq ($(ARCH),aarch64)
+GENARCH  ?= -mcpu=$(or $(GENCPU),generic)  # GENCPU: e.g. cortex-a76 for an RK3588 board (A55 + A76: both ARMv8.2-A)
 endif
 GENFLAGS += $(GENARCH) -fPIC
 OSFLAGS  := -Wno-format  # (%llx for uint64_t, which is unsigned long here: the same size)
