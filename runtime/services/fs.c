@@ -10,6 +10,7 @@
 #include "../hle.h"
 #include "../ipc.h"
 #include "../nxpkg.h"
+#include "../romfs_build.h"
 
 // Replacement / extra RomFS files and separate save slots from a folder (in LAS Recomp: randomizer seeds). The
 // overlay machinery below stays for mod support; no folder is used yet.
@@ -27,11 +28,14 @@ static bool mod_romfs_override(const char *path, char *host, size_t n) {
 const char *g_save_dir = "save";
 static int romfs_fd = -1;
 // The RomFS: an image file (romfs.bin, tools/nca_extract.py --romfs-image) or read straight from the player's game
-// package (romfs.src, written by the start screen's setup: runtime/nxpkg.c)
+// package (romfs.src, written by the start screen's setup: runtime/nxpkg.c), or the image of an already extracted
+// romfs/ folder made in place (romfs_build.h: no romfs.bin written)
 static NxRomfs *romfs_pkg;
+static RomfsVirt *romfs_dirimg;
 
 static ssize_t rom_pread(int fd, void *dst, size_t n, off_t off) {
     if (fd == romfs_fd && romfs_pkg) return nx_romfs_pread(romfs_pkg, dst, n, (uint64_t)off);
+    if (fd == romfs_fd && romfs_dirimg) return (ssize_t)romfs_virt_pread(romfs_dirimg, dst, n, (uint64_t)off);
     return pread(fd, dst, n, off);
 }
 
@@ -64,10 +68,12 @@ RT_ON_RESET(fs_reset) {
     ov_meta = NULL, ov_meta_off = ov_meta_size = ov_end = 0;
     npatches = 0;
     rom_files = NULL, rom_nfiles = 0, rom_data_off = 0;
-    if (romfs_fd >= 0 && !romfs_pkg) close(romfs_fd);
+    if (romfs_fd >= 0 && !romfs_pkg && !romfs_dirimg) close(romfs_fd);
     romfs_fd = -1;
     nx_romfs_close(romfs_pkg);
     romfs_pkg = NULL;
+    romfs_virt_close(romfs_dirimg);
+    romfs_dirimg = NULL;
     g_save_dir = "save";
 }
 
@@ -399,12 +405,26 @@ static Service *open_romfs_storage(void) {
             romfs_fd = ROMFS_PKG_FD;
             LOG("[fs] romfs from the game package (%llu bytes)\n", (unsigned long long)nx_romfs_size(romfs_pkg));
         }
-        if (romfs_fd < 0) FATAL("cannot open %s or %s: %s (set up the game files on the start screen)\n", path, src, why);
+        if (romfs_fd < 0) {  // an extracted romfs/ folder (the player's own, already decrypted): its image, in place
+            char why2[512] = "";
+            struct stat sb;
+            if (stat(g_romfs_dir, &sb) == 0 && S_ISDIR(sb.st_mode) &&
+                (romfs_dirimg = romfs_virt_open(g_romfs_dir, why2, sizeof why2))) {
+                romfs_fd = ROMFS_PKG_FD;
+                LOG("[fs] romfs from the folder %s (%llu bytes, no image written)\n", g_romfs_dir,
+                    (unsigned long long)romfs_virt_size(romfs_dirimg));
+            } else if (why2[0]) {
+                snprintf(why, sizeof why, "%s", why2);
+            }
+        }
+        if (romfs_fd < 0) FATAL("cannot open %s, %s or the folder %s: %s (set up the game files on the start screen)\n",
+                                path, src, g_romfs_dir, why);
         rom_index(romfs_fd);
     }
     Storage *st = calloc(1, sizeof *st);
     st->fd = romfs_fd;
     if (romfs_pkg) st->size = nx_romfs_size(romfs_pkg);
+    else if (romfs_dirimg) st->size = romfs_virt_size(romfs_dirimg);
     else {
         struct stat sb;
         fstat(romfs_fd, &sb);

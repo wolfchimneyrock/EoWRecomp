@@ -186,8 +186,11 @@ static std::string check_copied_files(const std::string &root) {
     size_t n = fread(id, 1, 8, f);
     fclose(f);
     if (n != 8 || memcmp(id, BUILD_ID, 8)) return "Wrong game version (needs v1.0.0)";
-    // the data the game reads (services/fs.c): an image, or the description of where it is in the game package
-    if (!file_exists(root + "/romfs.bin") && !file_exists(root + "/romfs.src")) return "Game data missing";
+    // the data the game reads (services/fs.c): an image, the description of where it is in the game package, or the
+    // extracted romfs/ folder itself (served in place)
+    if (!file_exists(root + "/romfs.bin") && !file_exists(root + "/romfs.src") &&
+        !file_exists(root + "/romfs/region_common"))
+        return "Game data missing";
     return "";
 }
 
