@@ -22,6 +22,16 @@ uint64_t romfs_dir_bytes(const char *dir);
 // above. false = failed.
 bool romfs_copy_tree(const char *src, const char *dst, void (*progress)(uint64_t done, uint64_t total));
 
+// The same image served in place from the folder, never written (services/fs.c: game files given as already
+// extracted exefs/ + romfs/ folders, no romfs.bin needed). The tables are built in memory when it is opened; file
+// data is read from the files on each read. NULL = failed (why).
+typedef struct RomfsVirt RomfsVirt;
+RomfsVirt *romfs_virt_open(const char *dir, char *why, size_t why_size);
+uint64_t romfs_virt_size(const RomfsVirt *v);
+// bytes [off, off + n) of the image; returns the count read (short only at the image's end), -1 on a read error
+int64_t romfs_virt_pread(RomfsVirt *v, void *dst, uint64_t n, uint64_t off);
+void romfs_virt_close(RomfsVirt *v);
+
 #ifdef __cplusplus
 }
 #endif

@@ -8,6 +8,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,41 +148,55 @@ static bool copy_data(FILE *out, const char *path, uint64_t size, uint8_t *buf, 
     return true;
 }
 
-bool romfs_build(const char *dir, const char *out_path, void (*progress)(uint64_t, uint64_t), char *why, size_t why_size) {
+// The image's layout: header, file list (table order, with data offsets) and the tables that follow the file data.
+typedef struct {
+    Dir *root;
+    Lists l;
+    uint8_t hdr[DATA_START];
+    uint8_t *tables;               // directory hash table, directory entries, file hash table, file entries
+    uint64_t tables_off, tables_size, data_size, total;
+} Layout;
+
+static void layout_free(Layout *y) {
+    free(y->tables), free(y->l.dirs), free(y->l.files);
+    free_tree(y->root);
+    memset(y, 0, sizeof *y);
+}
+
+static bool layout_make(const char *dir, Layout *y, char *why, size_t why_size) {
     #define FAIL(...) do { if (why) snprintf(why, why_size, __VA_ARGS__); goto fail; } while (0)
-    bool ok = false;
-    FILE *out = NULL;
-    uint8_t *dtab = NULL, *ftab = NULL, *buf = NULL;
+    memset(y, 0, sizeof *y);
+    uint8_t *dtab = NULL, *ftab = NULL;
     uint32_t *dbuckets = NULL, *fbuckets = NULL;
-    Lists l = {0};
-    Dir *root = scan(dir, "", NULL, 0);
+    Lists *l = &y->l;
+    Dir *root = y->root = scan(dir, "", NULL, 0);
     if (!root) FAIL("can't read %s", dir);
     // table order: root, then each directory's subdirectories as flatten() lists them; files likewise
-    if (l.nd == l.cd) l.dirs = realloc(l.dirs, sizeof *l.dirs * (l.cd = 64));
-    l.dirs[l.nd++] = root;
-    flatten(root, &l);
-    if (!l.nf) FAIL("no files in %s", dir);
+    if (l->nd == l->cd) l->dirs = realloc(l->dirs, sizeof *l->dirs * (l->cd = 64));
+    l->dirs[l->nd++] = root;
+    flatten(root, l);
+    if (!l->nf) FAIL("no files in %s", dir);
 
     // entry offsets
     uint32_t dsize = 0, fsize = 0;
-    for (int i = 0; i < l.nd; i++) l.dirs[i]->off = dsize, dsize += 0x18 + align4((uint32_t)strlen(l.dirs[i]->name));
-    for (int i = 0; i < l.nf; i++) l.files[i]->off = fsize, fsize += 0x20 + align4((uint32_t)strlen(l.files[i]->name));
+    for (int i = 0; i < l->nd; i++) l->dirs[i]->off = dsize, dsize += 0x18 + align4((uint32_t)strlen(l->dirs[i]->name));
+    for (int i = 0; i < l->nf; i++) l->files[i]->off = fsize, fsize += 0x20 + align4((uint32_t)strlen(l->files[i]->name));
     // file data offsets (relative to the data start), each 16-byte aligned
     uint64_t data = 0, total = 0;
-    for (int i = 0; i < l.nf; i++) {
+    for (int i = 0; i < l->nf; i++) {
         data = align16(data);
-        l.files[i]->data_off = data;
-        data += l.files[i]->size;
-        total += l.files[i]->size;
+        l->files[i]->data_off = data;
+        data += l->files[i]->size;
+        total += l->files[i]->size;
     }
 
-    uint32_t nbd = bucket_count((uint32_t)l.nd), nbf = bucket_count((uint32_t)l.nf);
+    uint32_t nbd = bucket_count((uint32_t)l->nd), nbf = bucket_count((uint32_t)l->nf);
     dbuckets = malloc(4 * nbd), fbuckets = malloc(4 * nbf);
     for (uint32_t i = 0; i < nbd; i++) dbuckets[i] = EMPTY;
     for (uint32_t i = 0; i < nbf; i++) fbuckets[i] = EMPTY;
     dtab = calloc(1, dsize), ftab = calloc(1, fsize);
-    for (int i = 0; i < l.nd; i++) {
-        Dir *d = l.dirs[i];
+    for (int i = 0; i < l->nd; i++) {
+        Dir *d = l->dirs[i];
         uint8_t *e = dtab + d->off;
         uint32_t parent = d->parent ? d->parent->off : 0, nl = (uint32_t)strlen(d->name);
         uint32_t sib = EMPTY;
@@ -198,8 +213,8 @@ bool romfs_build(const char *dir, const char *out_path, void (*progress)(uint64_
         memcpy(e + 0x18, d->name, nl);
         dbuckets[h] = d->off;
     }
-    for (int i = 0; i < l.nf; i++) {
-        File *f = l.files[i];
+    for (int i = 0; i < l->nf; i++) {
+        File *f = l->files[i];
         uint8_t *e = ftab + f->off;
         uint32_t nl = (uint32_t)strlen(f->name), sib = EMPTY;
         for (int k = 0; k + 1 < f->parent->nfiles; k++)
@@ -218,39 +233,150 @@ bool romfs_build(const char *dir, const char *out_path, void (*progress)(uint64_
     // header: tables after the file data (4-byte aligned)
     uint64_t dhash_off = (DATA_START + data + 3) & ~3ull;
     uint64_t dmeta_off = dhash_off + 4ull * nbd, fhash_off = dmeta_off + dsize, fmeta_off = fhash_off + 4ull * nbf;
-    uint8_t hdr[DATA_START] = {0};
     uint64_t hv[10] = {0x50, dhash_off, 4ull * nbd, dmeta_off, dsize, fhash_off, 4ull * nbf, fmeta_off, fsize, DATA_START};
-    memcpy(hdr, hv, sizeof hv);
+    memcpy(y->hdr, hv, sizeof hv);
+    y->tables_off = dhash_off;
+    y->tables_size = fmeta_off + fsize - dhash_off;
+    y->tables = malloc(y->tables_size);
+    memcpy(y->tables, dbuckets, 4ull * nbd);
+    memcpy(y->tables + (dmeta_off - dhash_off), dtab, dsize);
+    memcpy(y->tables + (fhash_off - dhash_off), fbuckets, 4ull * nbf);
+    memcpy(y->tables + (fmeta_off - dhash_off), ftab, fsize);
+    y->data_size = data;
+    y->total = total;
+    free(dtab), free(ftab), free(dbuckets), free(fbuckets);
+    return true;
+fail:
+    free(dtab), free(ftab), free(dbuckets), free(fbuckets);
+    layout_free(y);
+    return false;
+    #undef FAIL
+}
+
+bool romfs_build(const char *dir, const char *out_path, void (*progress)(uint64_t, uint64_t), char *why, size_t why_size) {
+    #define FAIL(...) do { if (why) snprintf(why, why_size, __VA_ARGS__); goto fail; } while (0)
+    bool ok = false;
+    FILE *out = NULL;
+    uint8_t *buf = NULL;
+    Layout y;
+    if (!layout_make(dir, &y, why, why_size)) return false;
+    Lists *l = &y.l;
 
     out = fopen(out_path, "wb");
     if (!out) FAIL("can't write %s", out_path);
-    if (fwrite(hdr, 1, DATA_START, out) != DATA_START) FAIL("write failed (disk full?)");
+    if (fwrite(y.hdr, 1, DATA_START, out) != DATA_START) FAIL("write failed (disk full?)");
     size_t bufsize = 4u << 20;
     buf = malloc(bufsize);
     uint64_t pos = 0, done = 0;
     static const uint8_t zero[16];
-    for (int i = 0; i < l.nf; i++) {
-        File *f = l.files[i];
+    for (int i = 0; i < l->nf; i++) {
+        File *f = l->files[i];
         if (f->data_off > pos && fwrite(zero, 1, (size_t)(f->data_off - pos), out) != f->data_off - pos)
             FAIL("write failed (disk full?)");
-        if (!copy_data(out, f->path, f->size, buf, bufsize, &done, total, progress)) FAIL("can't copy %s", f->path);
+        if (!copy_data(out, f->path, f->size, buf, bufsize, &done, y.total, progress)) FAIL("can't copy %s", f->path);
         pos = f->data_off + f->size;
     }
-    uint64_t tail = dhash_off - DATA_START - pos;
+    uint64_t tail = y.tables_off - DATA_START - pos;
     if (tail && fwrite(zero, 1, (size_t)tail, out) != tail) FAIL("write failed (disk full?)");
-    if (fwrite(dbuckets, 4, nbd, out) != nbd || fwrite(dtab, 1, dsize, out) != dsize ||
-        fwrite(fbuckets, 4, nbf, out) != nbf || fwrite(ftab, 1, fsize, out) != fsize)
-        FAIL("write failed (disk full?)");
+    if (fwrite(y.tables, 1, y.tables_size, out) != y.tables_size) FAIL("write failed (disk full?)");
     if (fclose(out) != 0) { out = NULL; FAIL("write failed (disk full?)"); }
     out = NULL;
     ok = true;
 fail:
     if (out) fclose(out);
     if (!ok) remove(out_path);
-    free(buf), free(dtab), free(ftab), free(dbuckets), free(fbuckets), free(l.dirs), free(l.files);
-    free_tree(root);
+    free(buf);
+    layout_free(&y);
     return ok;
     #undef FAIL
+}
+
+// ------------------------------------------------------------------ the image of a folder, served in place
+// The same image as romfs_build's, never written: the header and tables in memory, file data read from the files
+// themselves (opened per read: thread-safe, and no limit on open files for the game's ~11 000).
+struct RomfsVirt {
+    Layout y;
+    uint64_t size;
+};
+
+RomfsVirt *romfs_virt_open(const char *dir, char *why, size_t why_size) {
+    RomfsVirt *v = calloc(1, sizeof *v);
+    if (!layout_make(dir, &v->y, why, why_size)) { free(v); return NULL; }
+    v->size = v->y.tables_off + v->y.tables_size;
+    return v;
+}
+
+uint64_t romfs_virt_size(const RomfsVirt *v) { return v ? v->size : 0; }
+
+static int64_t virt_read_file(const File *f, uint8_t *dst, uint64_t n, uint64_t in) {
+#ifdef _WIN32
+    FILE *fp = fopen(f->path, "rb");
+    if (!fp) return -1;
+    int64_t r = _fseeki64(fp, (int64_t)in, SEEK_SET) == 0 ? (int64_t)fread(dst, 1, (size_t)n, fp) : -1;
+    fclose(fp);
+    return r;
+#else
+    int fd = open(f->path, O_RDONLY);
+    if (fd < 0) return -1;
+    uint64_t done = 0;
+    while (done < n) {
+        ssize_t r = pread(fd, dst + done, (size_t)(n - done), (off_t)(in + done));
+        if (r <= 0) break;
+        done += (uint64_t)r;
+    }
+    close(fd);
+    return (int64_t)done;
+#endif
+}
+
+int64_t romfs_virt_pread(RomfsVirt *v, void *dst_, uint64_t n, uint64_t off) {
+    uint8_t *dst = dst_;
+    if (off >= v->size) return 0;
+    if (n > v->size - off) n = v->size - off;
+    const Lists *l = &v->y.l;
+    uint64_t done = 0;
+    while (done < n) {
+        uint64_t o = off + done, left = n - done;
+        if (o < DATA_START) {  // header (and the zeros up to the data)
+            uint64_t k = DATA_START - o < left ? DATA_START - o : left;
+            memcpy(dst + done, v->y.hdr + o, (size_t)k);
+            done += k;
+            continue;
+        }
+        if (o >= v->y.tables_off) {  // the tables
+            memcpy(dst + done, v->y.tables + (o - v->y.tables_off), (size_t)left);
+            done += left;
+            continue;
+        }
+        // file data: the last file starting at or before o (binary search on data_off)
+        uint64_t rel = o - DATA_START;
+        int lo = 0, hi = l->nf - 1, at = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (l->files[mid]->data_off <= rel) at = mid, lo = mid + 1;
+            else hi = mid - 1;
+        }
+        const File *f = at >= 0 ? l->files[at] : NULL;
+        uint64_t next = at + 1 < l->nf ? l->files[at + 1]->data_off : v->y.tables_off - DATA_START;
+        if (f && rel < f->data_off + f->size) {
+            uint64_t k = f->data_off + f->size - rel < left ? f->data_off + f->size - rel : left;
+            int64_t r = virt_read_file(f, dst + done, k, rel - f->data_off);
+            if (r < 0) return done ? (int64_t)done : -1;
+            if ((uint64_t)r < k) memset(dst + done + r, 0, (size_t)(k - (uint64_t)r));  // (a file shorter than at the scan)
+            done += k;
+        } else {  // alignment padding between files, or before the tables
+            uint64_t k = next - rel < left ? next - rel : left;
+            memset(dst + done, 0, (size_t)k);
+            done += k;
+        }
+    }
+    return (int64_t)done;
+}
+
+void romfs_virt_close(RomfsVirt *v) {
+    if (!v) return;
+    layout_free(&v->y);
+    free(v);
 }
 
 // ------------------------------------------------------------------ copying the player's folder
