@@ -1,6 +1,6 @@
 # Status
 
-Atualizado: 2026-10-20 (sessão 3: macOS / Android).
+Atualizado: 2026-11-04 (branch eow-full-port: portes do LAS Recomp para Mali / Turnip).
 
 ## Jogo fixado (único build suportado)
 
@@ -25,6 +25,32 @@ Build IDs dos módulos (endereços de patches/HLE valem só para estes):
 | rtld | `2f1967113a281280a48ce3fc6dc23049327bf924` | 7 358 B |
 
 RomFS: 10 963 arquivos, 8 032 371 686 bytes (todos com magic válido: FRES, BNTX, MsgS, FSTM, SARC, FSHA, webm…).
+
+## eow-full-port (2026-11-04, Linux aarch64: Rock 5B Mali-G610 e Radxa Dragon Q6A Adreno 643)
+
+Sobre `eow-483-copies`, os portes do LAS Recomp para GPUs móveis, um commit cada:
+- Recursos do Vulkan 1.2 só onde o driver os tem (#561): o Turnip do Adreno 643 não tem armazenamento de 8 bits, e
+  pedir um recurso ausente fazia `vkCreateDevice` falhar.
+- Shaders estruturados (#562): pilhas SSY / PBK / PCNT resolvidas na tradução + eliminação de goto (if / else /
+  do-while em vez da máquina de estados do pc). Padrão: Mali e Adreno (`EOWRECOMP_VK_STATIC_STACKS` /
+  `EOWRECOMP_VK_STRUCTURE`).
+- c1 como literais e as palavras de constant buffer mais lidas como push constants (#563 / #579). Padrão: Mali e
+  Adreno (`EOWRECOMP_VK_INLINE_C1`, `EOWRECOMP_VK_PUSH_CB`, `EOWRECOMP_VK_PUSH_VS`).
+- Leituras de constant buffer por registrador fundidas em uvec4 (`EOWRECOMP_VK_CB_VEC4`, padrão: só Mali) e texturas
+  movidas para o primeiro uso (`EOWRECOMP_VK_SINK_TEX=1`, desligado).
+- Adreno: memória do jogo pelas cópias mesmo se o driver oferecer a importação do heap (`EOWRECOMP_VK_HOST_IMPORT=1`).
+- Ferramentas (#565): `EOWRECOMP_VK_SHADER_STATS=1`, `EOWRECOMP_GPUPROF_FILE=<arquivo>`.
+
+Verificado: `tools/test_translate.sh` (4000 programas por execução, glslangValidator + spirv-val) sem falhas com as
+opções ligadas e desligadas; tudo desligado, o GLSL é idêntico byte a byte ao de `467242a` (`TT_GLSL_REF=1`).
+Dragon (Turnip, Vulkan): início sem intervenção pelo bench, jogo renderizando, ~31 FPS a 720p. Rock 5B: instalado,
+não testado (HDMI desconectado).
+
+Não portado: o gmem em SSBO do fork do LAS (grande; o layout do c0 é o mesmo, dá para portar depois).
+
+Testar: no Dragon o lançador usa este build (`eowrecomp/USE_FULL`); no Rock 5B, `touch eowrecomp/USE_FULL`. Observar
+geometria faltando ou piscando (shaders estruturados / push constants): `EOWRECOMP_VK_STRUCTURE=0` ou
+`EOWRECOMP_VK_PUSH_CB=0` em `EOW_EXTRA` isola cada um.
 
 ## Sessão 3 (2026-10-20, MacBook Air M1 8 GB, macOS 27): macOS e Android
 
