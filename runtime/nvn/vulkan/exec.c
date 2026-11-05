@@ -692,6 +692,45 @@ static void *worker(void *a) {
     return NULL;
 }
 
+// Job watch: shader / pipeline builds that take long are logged when they end ("[job] ... took"), and ones still
+// running after 20 s by a watchdog ("[job] ... running for") - a driver compiler stuck on a shader starves the
+// workers, and every draw waiting for them is skipped. EOWRECOMP_VK_WORKERS=<n>: the worker count.
+typedef struct { _Atomic uint64_t t0; uint64_t reported; char what[112]; } JobSlot;
+static JobSlot job_slots[24];
+static _Atomic int job_nslots;
+static __thread int job_slot = -1;
+static void job_begin(const char *fmt, ...) {
+    if (job_slot < 0) job_slot = atomic_fetch_add(&job_nslots, 1) % 24;
+    JobSlot *js = &job_slots[job_slot];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(js->what, sizeof js->what, fmt, ap);
+    va_end(ap);
+    atomic_store(&js->t0, plat_now_ns());
+}
+static void job_end(void) {
+    if (job_slot < 0) return;
+    JobSlot *js = &job_slots[job_slot];
+    uint64_t dt = plat_now_ns() - atomic_load(&js->t0);
+    atomic_store(&js->t0, 0);
+    if (dt > 2000000000ull) LOG("[job] %s took %.1f s\n", js->what, dt / 1e9);
+}
+static void *job_watchdog(void *a) {
+    (void)a;
+    for (;;) {
+        SDL_Delay(5000);
+        uint64_t now = plat_now_ns();
+        for (int i = 0; i < 24; i++) {
+            uint64_t t0 = atomic_load(&job_slots[i].t0);
+            if (t0 && now - t0 > 20000000000ull && job_slots[i].reported != t0) {
+                job_slots[i].reported = t0;
+                LOG("[job] %s running for %.0f s\n", job_slots[i].what, (now - t0) / 1e9);
+            }
+        }
+    }
+    return NULL;
+}
+
 static bool sync_shaders(void) {
     static int v = -1;
     if (v < 0) v = getenv("EOWRECOMP_SYNC_SHADERS") != NULL;
@@ -742,6 +781,11 @@ static void run_job(void (*fn)(void *), void *arg) {
         int n = SDL_GetNumLogicalCPUCores() - 4;
         if (n < 4) n = 4;
         if (n > 16) n = 16;
+        if (getenv("EOWRECOMP_VK_WORKERS")) n = atoi(getenv("EOWRECOMP_VK_WORKERS"));
+        if (n < 1) n = 1;
+        if (n > 20) n = 20;
+        LOG("[vk] %d shader / pipeline workers\n", n);
+        { pthread_t t; pthread_create(&t, NULL, job_watchdog, NULL); }
         for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
     }
     Job *j = malloc(sizeof *j);
@@ -1348,8 +1392,15 @@ static void override_glsl(ShaderInfo *si, uint64_t addr, const char *suffix) {
     LOG("[shader] %s replaced by %s\n", suffix, path);
 }
 
+static void compile_program_(Prog *p);
 static void compile_program(void *arg) {
     Prog *p = arg;
+    job_begin("spirv vs %llx fs %llx (glsl %zu + %zu bytes)", (unsigned long long)p->code[0], (unsigned long long)p->code[1],
+              strlen(p->vi->msl), strlen(p->fi->msl));
+    compile_program_(p);
+    job_end();
+}
+static void compile_program_(Prog *p) {
     size_t nv = 0, nf = 0;
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
@@ -1728,7 +1779,9 @@ static void build_pipeline(void *arg) {
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
     if (g_vk.exec_stats) pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    job_begin("pipeline vs %llx fs %llx", (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+    job_end();
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
@@ -2813,8 +2866,9 @@ typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; } C
 static void build_compute(void *arg) {
     CsProg *cp = arg;
     size_t n = 0;
+    job_begin("compute (glsl %zu bytes)", strlen(cp->si->msl));
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
-    if (!spv) { atomic_store(&cp->p.state, 2); return; }
+    if (!spv) { job_end(); atomic_store(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
     VkShaderModule m = vk_module(spv, n);
     free(spv);
@@ -2828,6 +2882,7 @@ static void build_compute(void *arg) {
                                       .layout = cp->p.layout};
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
     atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
+    job_end();
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS) LOG("[compute] pipeline failed: %d\n", r);
 }
