@@ -30,6 +30,7 @@ bool maxwell_gmem_mirror;       // shader.h
 bool maxwell_glsl_structured;   // shader.h: static stacks + structured control flow (exec.c: Mali, Adreno)
 bool maxwell_glsl_push;         // shader.h: c1 inlined + push constants (exec.c: Mali, Adreno)
 _Thread_local uint32_t maxwell_push_base, maxwell_push_cap = 64;  // shader.h (per translating thread)
+bool maxwell_sink_tex;          // shader.h: texture fetches moved down to their first use (off)
 // Iteration limit of a branching shader's dispatch loop (a mistranslated branch can't hang the GPU forever).
 // EOWRECOMP_SHADER_GUARD overrides it (backends read it): a small one shows which shaders loop.
 uint32_t maxwell_loop_guard = 100000;
@@ -2290,6 +2291,253 @@ static void push_promote(Ctx *c, Str *body) {
     for (int i = 0; i < n; i++) c->info->push_cb[i] = words[i].cb, c->info->push_off[i] = words[i].off;
 }
 
+// EOWRECOMP_VK_SINK_TEX=1 (GLSL; default maxwell_sink_tex, off; from LAS Recomp's fork): texture fetches moved down to
+// just before their results are first used. NVIDIA's compiler issues them early (its latency hiding), so their results stay live for most of the shader: in the lights'
+// shaders 12-20 registers across ~1500 lines, which keeps them at 64 registers / one thread on Mali (which hides
+// latency with threads). GPU compilers don't move them themselves: an implicit-LOD texture() needs uniform control flow.
+// So a fetch moves only within its own scope (never into or out of an if / loop: the same uniformity), past units
+// (statements, or whole nested if / else / do blocks) that neither read nor write its results nor write its inputs,
+// and never past a discard, break / continue, an image / global memory store or an atomic.
+typedef struct { int first, last; } TexUnit;  // lines [first, last]
+static bool unit_touches(char **ln, TexUnit u, const char *name) {  // name as a whole token
+    size_t n = strlen(name);
+    for (int i = u.first; i <= u.last; i++)
+        for (const char *p = strstr(ln[i], name); p; p = strstr(p + 1, name)) {
+            char a = p > ln[i] ? p[-1] : ' ', z = p[n];
+            if (!((a >= 'a' && a <= 'z') || (a >= 'A' && a <= 'Z') || (a >= '0' && a <= '9') || a == '_') &&
+                !((z >= 'a' && z <= 'z') || (z >= 'A' && z <= 'Z') || (z >= '0' && z <= '9') || z == '_')) return true;
+        }
+    return false;
+}
+static bool unit_writes(char **ln, TexUnit u, const char *name) {  // "name =" (not ==, <=, >=, !=)
+    size_t n = strlen(name);
+    for (int i = u.first; i <= u.last; i++)
+        for (const char *p = strstr(ln[i], name); p; p = strstr(p + 1, name)) {
+            char a = p > ln[i] ? p[-1] : ' ';
+            if ((a >= 'a' && a <= 'z') || (a >= '0' && a <= '9') || a == '_') continue;
+            const char *q = p + n;
+            if (*q >= '0' && *q <= '9') continue;
+            while (*q == ' ') q++;
+            if (q[0] == '=' && q[1] != '=') return true;
+            if ((q[0] == '+' || q[0] == '-' || q[0] == '*' || q[0] == '/' || q[0] == '|' || q[0] == '&' || q[0] == '^') && q[1] == '=') return true;
+            if ((q[0] == '+' && q[1] == '+') || (q[0] == '-' && q[1] == '-')) return true;
+        }
+    return false;
+}
+static bool unit_has(char **ln, TexUnit u, const char *s) {
+    for (int i = u.first; i <= u.last; i++) if (strstr(ln[i], s)) return true;
+    return false;
+}
+static bool unit_barrier(char **ln, TexUnit u) {
+    return unit_has(ln, u, "discard") || unit_has(ln, u, "break;") || unit_has(ln, u, "continue;") ||
+           unit_has(ln, u, "imageStore") || unit_has(ln, u, "atomic") || unit_has(ln, u, "gmem_.w[") ||
+           unit_has(ln, u, "gfast_") || unit_has(ln, u, "barrier(") || unit_has(ln, u, "return") ||
+           unit_has(ln, u, "case ") || unit_has(ln, u, "default:") || unit_has(ln, u, "pc = ") || unit_has(ln, u, "exit_now");
+}
+static bool unit_is_tex(char **ln, TexUnit u) {  // a fetch and the register copies of its result: "{ vec4 t = texture...; rN = ...; }"
+    const char *s = ln[u.first];
+    while (*s == ' ') s++;
+    return s[0] == '{' && (strstr(s, "texture") || strstr(s, "texelFetch")) && !unit_has(ln, u, "if (");
+}
+// The registers / predicates a unit names (r0..r255, p0..p6): bits
+static void unit_names(char **ln, TexUnit u, uint8_t *regs, uint8_t *preds, bool writes_only) {
+    char nm[8];
+    for (int r = 0; r < 256; r++) {
+        snprintf(nm, sizeof nm, "r%d", r);
+        if (writes_only ? unit_writes(ln, u, nm) : unit_touches(ln, u, nm)) regs[r] = 1;
+    }
+    for (int k = 0; k < 7; k++) {
+        snprintf(nm, sizeof nm, "p%d", k);
+        if (writes_only ? unit_writes(ln, u, nm) : unit_touches(ln, u, nm)) preds[k] = 1;
+    }
+}
+static bool units_conflict(char **ln, TexUnit tex, TexUnit v) {
+    uint8_t tw[256] = {0}, twp[8] = {0}, tr[256] = {0}, trp[8] = {0}, vw[256] = {0}, vwp[8] = {0}, vr[256] = {0}, vrp[8] = {0};
+    unit_names(ln, tex, tw, twp, true);   // its results
+    unit_names(ln, tex, tr, trp, false);  // everything it names (its inputs too)
+    unit_names(ln, v, vw, vwp, true);
+    unit_names(ln, v, vr, vrp, false);
+    for (int r = 0; r < 256; r++) if ((tw[r] && vr[r]) || (tr[r] && vw[r])) return true;
+    for (int k = 0; k < 7; k++) if ((twp[k] && vrp[k]) || (trp[k] && vwp[k])) return true;
+    return false;
+}
+static int tex_units(char **ln, int from, int to, TexUnit *u, int max) {  // the units of lines [from, to) at one depth
+    int n = 0;
+    for (int i = from; i < to && n < max;) {
+        int bal = 0, j = i;
+        for (;;) {
+            for (const char *p = ln[j]; *p; p++) bal += *p == '{' ? 1 : *p == '}' ? -1 : 0;
+            if (bal <= 0 || j + 1 >= to) break;
+            j++;
+        }
+        u[n++] = (TexUnit){i, j};
+        i = j + 1;
+    }
+    return n;
+}
+static int tex_sunk, tex_copied;
+typedef struct { char **ln; int n, cap; } Lines;  // (the body's lines while sinking: the copies insert lines)
+static int dest_count(char **ln, TexUnit u) {  // its result registers ("rN = as_u(t[..])")
+    int n = 0;
+    for (int i = u.first; i <= u.last; i++) for (const char *p = ln[i]; (p = strstr(p, "= as_u(t[")); p++) n++;
+    return n;
+}
+// The registers the fetch line (its first) reads: copied into fresh variables at the fetch's place, so writes to them
+// later don't hold the fetch there. Done when its results are as many registers as its inputs or more (else the copies
+// would keep more alive than the results did).
+static int fetch_inputs(const char *f, int *regs, int max) {  // the registers a fetch line reads
+    int nr = 0;
+    for (const char *p = f; *p && nr < max; p++) {
+        if (p[0] != 'r' || !(p[1] >= '0' && p[1] <= '9')) continue;
+        if (p > f && ((p[-1] >= 'a' && p[-1] <= 'z') || (p[-1] >= '0' && p[-1] <= '9') || p[-1] == '_')) continue;
+        int r = atoi(p + 1), k = 0;
+        while (k < nr && regs[k] != r) k++;
+        if (k == nr) regs[nr++] = r;
+    }
+    return nr;
+}
+static bool holds_results(char **ln, TexUnit tex, TexUnit v) {  // v reads or writes one of tex's results
+    for (int i = tex.first; i <= tex.last; i++)
+        for (const char *p = ln[i]; (p = strstr(p, "= as_u(t[")); p++) {
+            const char *e = p - 1;
+            while (e > ln[i] && e[-1] == ' ') e--;
+            const char *s = e;
+            while (s > ln[i] && ((s[-1] >= '0' && s[-1] <= '9') || s[-1] == 'r')) { s--; if (*s == 'r') break; }
+            char nm[8];
+            snprintf(nm, sizeof nm, "%.*s", (int)(e - s), s);
+            if (nm[0] == 'r' && unit_touches(ln, v, nm)) return true;
+        }
+    return false;
+}
+static _Thread_local int tex_seq;  // (the copies' names: per shader, from 0 - the same GLSL every time, for the caches)
+static bool copy_inputs(Lines *L, int at, TexUnit u, int results) {  // only when its results outnumber its inputs
+    char *f = L->ln[u.first];
+    int regs[16], nr = 0;
+    for (const char *p = f; *p && nr < 16; p++) {
+        if (p[0] != 'r' || !(p[1] >= '0' && p[1] <= '9')) continue;
+        if (p > f && ((p[-1] >= 'a' && p[-1] <= 'z') || (p[-1] >= '0' && p[-1] <= '9') || p[-1] == '_')) continue;
+        int r = atoi(p + 1), k = 0;
+        while (k < nr && regs[k] != r) k++;
+        if (k == nr) regs[nr++] = r;
+    }
+    if (!nr || results < nr) return false;
+    int id = tex_seq++;
+    Str decl = {0}, nf = {0};
+    sp(&decl, "    uint");
+    for (int k = 0; k < nr; k++) sp(&decl, "%s sc%d_%d = r%d", k ? "," : "", id, regs[k], regs[k]);
+    sp(&decl, ";  // (the fetch below moved down: its inputs)");
+    for (const char *p = f; *p;) {  // the fetch line, reading the copies
+        if (p[0] == 'r' && p[1] >= '0' && p[1] <= '9' && !(p > f && ((p[-1] >= 'a' && p[-1] <= 'z') || (p[-1] >= '0' && p[-1] <= '9') || p[-1] == '_'))) {
+            char *e2;
+            long r = strtol(p + 1, &e2, 10);
+            sp(&nf, "sc%d_%ld", id, r);
+            p = e2;
+        } else { sp(&nf, "%c", *p); p++; }
+    }
+    L->ln[u.first] = nf.buf;  // (leaked with the pass's strings: freed with the body below)
+    if (L->n == L->cap) L->ln = realloc(L->ln, (size_t)(L->cap *= 2) * sizeof *L->ln);
+    memmove(L->ln + at + 1, L->ln + at, (size_t)(L->n - at) * sizeof *L->ln);
+    L->ln[at] = decl.buf;
+    L->n++;
+    tex_copied++;
+    return true;
+}
+// Inputs of fetch k whose value is a constant set earlier in this scope ("r4 = 0u;", a shadow tap's layer): the
+// literal goes into the fetch, so moving it down holds nothing for them.
+static int tex_folded;
+static void fold_const_inputs(char **ln, TexUnit *u, int k) {
+    int regs[16], nr = fetch_inputs(ln[u[k].first], regs, 16);
+    for (int x = 0; x < nr; x++) {
+        char nm[8], lit[32] = "";
+        snprintf(nm, sizeof nm, "r%d", regs[x]);
+        for (int j = k - 1; j >= 0; j--) {
+            if (unit_barrier(ln, u[j])) break;
+            if (!unit_writes(ln, u[j], nm)) continue;
+            const char *s = ln[u[j].first];
+            while (*s == ' ') s++;
+            size_t n = strlen(nm);
+            if (u[j].first == u[j].last && !strncmp(s, nm, n) && !strncmp(s + n, " = ", 3)) {
+                const char *v = s + n + 3, *e = v;
+                if (e[0] == '0' && e[1] == 'x') e += 2;
+                while ((*e >= '0' && *e <= '9') || (*e >= 'a' && *e <= 'f')) e++;
+                if (e > v && e[0] == 'u' && e[1] == ';' && !e[2] && (size_t)(e - v + 1) < sizeof lit) snprintf(lit, sizeof lit, "%.*s", (int)(e - v + 1), v);
+            }
+            break;
+        }
+        if (!lit[0]) continue;
+        const char *f = ln[u[k].first];
+        Str nf = {0};
+        for (const char *p = f; *p;) {
+            size_t n = strlen(nm);
+            if (!strncmp(p, nm, n) && !(p[n] >= '0' && p[n] <= '9') &&
+                !(p > f && ((p[-1] >= 'a' && p[-1] <= 'z') || (p[-1] >= '0' && p[-1] <= '9') || p[-1] == '_'))) {
+                sp(&nf, "%s", lit); p += n;
+            } else { sp(&nf, "%c", *p); p++; }
+        }
+        ln[u[k].first] = nf.buf;  // (kept, like the copies)
+        tex_folded++;
+    }
+}
+static void sink_scope(Lines *L, int from, int *to) {
+    enum { MAXU = 4096 };
+    TexUnit *u = malloc(MAXU * sizeof *u);
+    int n = tex_units(L->ln, from, *to, u, MAXU);
+    for (int k = 0; k < n; k++)  // (nested blocks first: their own scopes)
+        if (u[k].last > u[k].first && !unit_is_tex(L->ln, u[k])) {
+            int end = u[k].last, before = L->n;
+            sink_scope(L, u[k].first + 1, &end);
+            int grew = L->n - before;
+            if (grew) { *to += grew; n = tex_units(L->ln, from, *to, u, MAXU); }
+        }
+    for (int k = n - 2; k >= 0; k--) {  // (from the last: a fetch moved down never passes one still to move)
+        if (!unit_is_tex(L->ln, u[k])) continue;
+        fold_const_inputs(L->ln, u, k);
+        int dst = k;
+        while (dst + 1 < n && !unit_barrier(L->ln, u[dst + 1]) && !units_conflict(L->ln, u[k], u[dst + 1])) dst++;
+        // held by a write to its inputs (not by its results being used): copy the inputs and try again
+        if (dst + 1 < n && !unit_barrier(L->ln, u[dst + 1]) && !unit_is_tex(L->ln, u[dst + 1]) &&
+            !holds_results(L->ln, u[k], u[dst + 1]) && copy_inputs(L, u[k].first, u[k], dest_count(L->ln, u[k]))) {
+            (*to)++;
+            n = tex_units(L->ln, from, *to, u, MAXU);
+            k++;  // (the copy line is unit k now, the fetch k + 1)
+            dst = k;
+            while (dst + 1 < n && !unit_barrier(L->ln, u[dst + 1]) && !units_conflict(L->ln, u[k], u[dst + 1])) dst++;
+        }
+        if (dst == k) continue;
+        int a = u[k].first, mlen = u[k].last - u[k].first + 1, b = u[dst].last;  // (the fetch's lines go after u[k+1..dst])
+        char **tmp = malloc((size_t)mlen * sizeof *tmp);
+        memcpy(tmp, L->ln + a, (size_t)mlen * sizeof *tmp);
+        memmove(L->ln + a, L->ln + a + mlen, (size_t)(b - a - mlen + 1) * sizeof *tmp);
+        memcpy(L->ln + b - mlen + 1, tmp, (size_t)mlen * sizeof *tmp);
+        free(tmp);
+        n = tex_units(L->ln, from, *to, u, MAXU);
+        tex_sunk++;
+    }
+    free(u);
+}
+static void sink_textures(Ctx *c, Str *body) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("EOWRECOMP_VK_SINK_TEX"); on = e ? atoi(e) != 0 : maxwell_sink_tex; }
+    if (!on || !body->buf || (c->stage != STAGE_FRAGMENT && c->stage != STAGE_COMPUTE)) return;
+    tex_seq = 0;
+    Lines L = {malloc(1024 * sizeof(char *)), 0, 1024};
+    for (char *p = body->buf, *e; *p; p = e + 1) {
+        e = strchr(p, '\n');
+        if (!e) e = p + strlen(p) - 1;
+        if (L.n == L.cap) L.ln = realloc(L.ln, (size_t)(L.cap *= 2) * sizeof *L.ln);
+        L.ln[L.n++] = p;
+        if (e[0] == '\n') e[0] = 0;
+        if (!e[1]) break;
+    }
+    int end = L.n;
+    sink_scope(&L, 0, &end);
+    Str o = {0};
+    for (int i = 0; i < L.n; i++) sp(&o, "%s\n", L.ln[i]);
+    free(L.ln);  // (the copies' strings stay allocated: a few per shader)
+    free(body->buf);
+    *body = o;
+}
+
 static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     ShaderInfo *info = c->info;
     const ShaderKey *key = c->key;
@@ -2297,6 +2545,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     Str body = {0};
     glsl_rewrite(c, &body, c->body.buf ? c->body.buf : "");
     push_promote(c, &body);
+    sink_textures(c, &body);
     uint32_t hi_word = info->uses_gmem ? maxwell_gmem_hi_word : 0;
     if (hi_word && body.buf) { char *b2 = gmem_split(body.buf, hi_word); free(body.buf); body.buf = b2; }
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);

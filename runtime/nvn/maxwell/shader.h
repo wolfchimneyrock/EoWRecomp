@@ -119,6 +119,8 @@ extern bool maxwell_glsl_structured;
 // maxwell_translate, on its own thread.
 extern bool maxwell_glsl_push;
 extern _Thread_local uint32_t maxwell_push_base, maxwell_push_cap;
+// (GLSL) Texture fetches moved down to their first use (EOWRECOMP_VK_SINK_TEX=1, off): from LAS Recomp's fork.
+extern bool maxwell_sink_tex;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;
