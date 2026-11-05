@@ -204,6 +204,14 @@ static void create_device(void) {
     if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);  // guest heap as a GPU buffer (exec.c)
     if (getenv("EOWRECOMP_VK_NO_HOST_IMPORT")) g_vk.host_import = false;  // (tests the copies, exec.c gmir_, on any GPU)
+    // Turnip (Adreno): the copies, not a heap import, even where the driver offers one (Mesa main). The import would sit
+    // in its cached + coherent memory type, where every GPU read of the heap snoops the CPU caches: LAS Recomp on an
+    // Adreno 643, GPU 27.7 ms per frame with the heap in that memory, 17.8 ms with the copies (#556).
+    // EOWRECOMP_VK_HOST_IMPORT=1: import anyway.
+    if (g_vk.host_import && g_vk.props.vendorID == 0x5143 && !getenv("EOWRECOMP_VK_HOST_IMPORT")) {
+        g_vk.host_import = false;
+        LOG("[vk] Adreno: guest memory through copies, no heap import (EOWRECOMP_VK_HOST_IMPORT=1: import)\n");
+    }
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
 #ifdef __ANDROID__
     // without it (Adreno): the heap is an AHardwareBuffer (platform/android.c), imported and read through buffer
