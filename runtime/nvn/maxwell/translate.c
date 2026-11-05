@@ -31,6 +31,7 @@ bool maxwell_glsl_structured;   // shader.h: static stacks + structured control 
 bool maxwell_glsl_push;         // shader.h: c1 inlined + push constants (exec.c: Mali, Adreno)
 _Thread_local uint32_t maxwell_push_base, maxwell_push_cap = 64;  // shader.h (per translating thread)
 bool maxwell_sink_tex;          // shader.h: texture fetches moved down to their first use (off)
+bool maxwell_cb_vec4;           // shader.h: merged constant buffer reads (exec.c: Mali)
 // Iteration limit of a branching shader's dispatch loop (a mistranslated branch can't hang the GPU forever).
 // EOWRECOMP_SHADER_GUARD overrides it (backends read it): a small one shows which shaders loop.
 uint32_t maxwell_loop_guard = 100000;
@@ -2538,6 +2539,96 @@ static void sink_textures(Ctx *c, Str *body) {
     *body = o;
 }
 
+// Constant buffer reads at a register offset ("rD = cbr(cbN, (rB) + Ku);", from LDC) one 32-bit word at a time:
+// ARM's compiler issues a memory load for each (a bone palette in a skinned vertex shader: 36 per vertex; a light
+// loop: 31 per light). NVIDIA reads them 16 bytes at a time. Up to four reads of one base into the same 16 bytes
+// become one uvec4 load when the base is 16-byte aligned (as these tables are), the word reads otherwise
+// (EOWRECOMP_VK_CB_VEC4=1 / =0; default maxwell_cb_vec4: Mali, exec.c; from LAS Recomp's fork). malioc, G610: the
+// skinned vertex shader's loads 41 -> 14 cycles, the main lit pass 40 -> 32.
+static bool parse_cbr(const char *s, int *d, int *cb, int *base, unsigned *k) {
+    int n = -1;
+    if (sscanf(s, " r%d = cbr(cb%d, (r%d) + %uu);%n", d, cb, base, k, &n) != 4 || n < 0) return false;
+    return s[n] == 0 && (*k & 3) == 0;
+}
+static int cb_vec4_groups;
+static void vec_cbr(Ctx *c, Str *body) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("EOWRECOMP_VK_CB_VEC4"); on = e ? atoi(e) != 0 : maxwell_cb_vec4; }
+    if (!on || !body->buf || !strstr(body->buf, "cbr(")) return;
+    (void)c;
+    Lines L = {malloc(1024 * sizeof(char *)), 0, 1024};
+    for (char *p = body->buf, *e; *p; p = e + 1) {
+        e = strchr(p, '\n');
+        if (!e) e = p + strlen(p) - 1;
+        if (L.n == L.cap) L.ln = realloc(L.ln, (size_t)(L.cap *= 2) * sizeof *L.ln);
+        L.ln[L.n++] = p;
+        if (e[0] == '\n') e[0] = 0;
+        if (!e[1]) break;
+    }
+    char **rep = calloc((size_t)L.n, sizeof *rep);  // (the merged block, at its first read)
+    bool *drop = calloc((size_t)L.n, sizeof *drop);  // (the other reads of a group)
+    for (int i = 0; i < L.n; i++) {
+        int d0, cb, base; unsigned k0;
+        if (drop[i] || !parse_cbr(L.ln[i], &d0, &cb, &base, &k0) || d0 == base) continue;
+        int gl[4] = {i}, gd[4] = {d0}, ng = 1;
+        unsigned gk[4] = {k0};
+        char bn[8];
+        snprintf(bn, sizeof bn, "r%d", base);
+        for (int j = i + 1; j < L.n && j <= i + 48 && ng < 4; j++) {
+            int d, cb2, b2; unsigned k;
+            if (parse_cbr(L.ln[j], &d, &cb2, &b2, &k) && cb2 == cb && b2 == base && k / 16 == k0 / 16) {
+                bool clash = false;  // (moved up to the first read: nothing between may use or set its register)
+                char dn[8];
+                snprintf(dn, sizeof dn, "r%d", d);
+                for (int x = i + 1; x < j && !clash; x++) if (!drop[x]) clash = unit_touches(L.ln, (TexUnit){x, x}, dn);
+                if (clash) break;
+                gl[ng] = j, gd[ng] = d, gk[ng] = k, ng++;
+                if (d == base) break;  // (the base's last read)
+                continue;
+            }
+            // anything else between: no braces (same block), and it must not set the base. (It may use the group's
+            // registers read so far: they are set before it either way. A read moved up past it is checked above.)
+            if (strstr(L.ln[j], "case ") || strstr(L.ln[j], "default:")) break;
+            int e = j, bal = 0;  // (a whole { ... } block counts as one step: an XMAD's temporaries)
+            for (;;) {
+                for (const char *q = L.ln[e]; *q; q++) bal += *q == '{' ? 1 : *q == '}' ? -1 : 0;
+                if (bal <= 0 || e + 1 >= L.n || e > j + 32) break;
+                e++;
+            }
+            if (bal != 0) break;  // (the end of this block, or a long one)
+            TexUnit u = {j, e};
+            if (unit_writes(L.ln, u, bn) || unit_has(L.ln, u, "break;") || unit_has(L.ln, u, "continue;") ||
+                unit_has(L.ln, u, "return") || unit_has(L.ln, u, "discard") || unit_has(L.ln, u, "pc = ") ||
+                unit_has(L.ln, u, "exit_now")) break;
+            j = e;
+        }
+        if (ng < 2) continue;
+        Str s = {0};
+        const char *ind = L.ln[i];
+        int w = 0;
+        while (ind[w] == ' ') w++;
+        sp(&s, "%.*s{ uint o_ = r%d + %uu; uvec4 q_ = cb%d[min(o_ >> 4, uint(cb%d.length() - 1))];  // (%d constant reads in one)\n",
+           w, ind, base, k0 / 16 * 16, cb, cb, ng);
+        sp(&s, "%.*s  if ((o_ & 15u) == 0u) {", w, ind);
+        for (int g = 0; g < ng; g++) sp(&s, " r%d = q_[%u];", gd[g], (gk[g] >> 2) & 3);
+        sp(&s, " } else {");
+        for (int g = 0; g < ng; g++) sp(&s, " r%d = cbr(cb%d, (r%d) + %uu);", gd[g], cb, base, gk[g]);
+        sp(&s, " }\n%.*s}", w, ind);
+        rep[i] = s.buf;
+        for (int g = 1; g < ng; g++) drop[gl[g]] = true;
+        cb_vec4_groups++;
+    }
+    Str o = {0};
+    for (int i = 0; i < L.n; i++) {
+        if (drop[i]) continue;
+        sp(&o, "%s\n", rep[i] ? rep[i] : L.ln[i]);
+        free(rep[i]);
+    }
+    free(rep); free(drop); free(L.ln);
+    free(body->buf);
+    *body = o;
+}
+
 static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     ShaderInfo *info = c->info;
     const ShaderKey *key = c->key;
@@ -2546,6 +2637,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     glsl_rewrite(c, &body, c->body.buf ? c->body.buf : "");
     push_promote(c, &body);
     sink_textures(c, &body);
+    vec_cbr(c, &body);
     uint32_t hi_word = info->uses_gmem ? maxwell_gmem_hi_word : 0;
     if (hi_word && body.buf) { char *b2 = gmem_split(body.buf, hi_word); free(body.buf); body.buf = b2; }
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
