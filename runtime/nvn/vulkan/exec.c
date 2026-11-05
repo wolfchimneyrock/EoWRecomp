@@ -1225,6 +1225,13 @@ void vk_exec_init(void) {
     LOG("[vk] constant-buffer push constants %s (%s, %u bytes of push constants)\n",
         (pe ? atoi(pe) != 0 : maxwell_glsl_push) ? "on" : "off", pe ? "EOWRECOMP_VK_PUSH_CB" : "default for this GPU",
         g_vk.props.limits.maxPushConstantsSize);
+    // Constant buffer reads at one register offset merged into uvec4 loads on Mali only: Arm's compiler issues a load
+    // per word (LAS: fragment load/store -34% on a Mali-G610), while on Turnip the merged form cost +55% vertex shader
+    // instructions. EOWRECOMP_VK_CB_VEC4=1 / =0 overrides.
+    maxwell_cb_vec4 = g_vk.props.vendorID == 0x13B5;
+    const char *ve = getenv("EOWRECOMP_VK_CB_VEC4");
+    LOG("[vk] merged constant-buffer reads %s (%s)\n", (ve ? atoi(ve) != 0 : maxwell_cb_vec4) ? "on" : "off",
+        ve ? "EOWRECOMP_VK_CB_VEC4" : "default for this GPU");
 }
 
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy);

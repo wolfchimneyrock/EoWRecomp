@@ -131,6 +131,9 @@ extern _Thread_local uint32_t maxwell_push_base, maxwell_push_cap;
 void maxwell_set_cb1(const uint8_t *data, uint32_t size);
 // (GLSL) Texture fetches moved down to their first use (EOWRECOMP_VK_SINK_TEX=1, off): from LAS Recomp's fork.
 extern bool maxwell_sink_tex;
+// (GLSL) Constant buffer reads at one register offset merged into uvec4 loads (EOWRECOMP_VK_CB_VEC4 overrides; the
+// backend's default: Mali, a loss on Turnip): from LAS Recomp's fork.
+extern bool maxwell_cb_vec4;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;
