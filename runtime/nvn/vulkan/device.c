@@ -831,6 +831,13 @@ int ui_run(void) {
         while (SDL_WaitEventTimeout(&e, 16)) {
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
+#if defined(__linux__) && !defined(__ANDROID__)
+                // (Linux, libmali) exit() runs the driver's own exit handlers - registered after quick_exit_handler,
+                // so they run first - while worker threads still compile and present: abort in libmali's
+                // cmpbep_shutdown_llvm (double free) and SIGSEGVs in the driver at every quit on a Mali-G610.
+                // Straight to the GPU wait, the pipeline cache and _exit instead (as BOTWRecomp's rock5 fix).
+                quick_exit_handler();
+#endif
                 exit(0);
             }
             extern bool input_user_blocked(const SDL_Event *e);
