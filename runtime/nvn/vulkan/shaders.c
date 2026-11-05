@@ -133,7 +133,9 @@ static bool opt_stage(int stage) {
 // spirv-opt folds / reassociates no float math carrying NoContraction, so the depth pre-pass and colour pass keep
 // bit-identical positions; what goes is the -O0 bulk (guest registers as function variables, the pc loop) that
 // Mali's compiler is slow with. (shaderc's own -O ran before no_contraction: that is what broke the EQUAL test.)
-// EOWRECOMP_VK_OPT_VS=1: on.
+// Default on Mali: this game's -O0 vertex shaders (~75 KB of GLSL each) took Mali's compiler 10-120 s per pipeline,
+// and every pipeline variant compiles them again (the light-loop pass: 4 variants x 120 s on a Mali-G610); optimised
+// first, most of those pipelines build in under 2 s. EOWRECOMP_VK_OPT_VS=0/1 forces it off / on.
 typedef struct spv_optimizer_t spv_optimizer_t;
 typedef struct spv_optimizer_options_t *spv_optimizer_options;
 typedef struct { uint32_t *code; size_t wordCount; } spv_binary_t;
@@ -159,8 +161,8 @@ static bool opt_vertex(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("EOWRECOMP_VK_OPT_VS");
-        on = e && atoi(e) != 0;
-        if (on) LOG("[vk] vertex shaders optimised after NoContraction (EOWRECOMP_VK_OPT_VS)\n");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;  // (ARM)
+        if (on) LOG("[vk] vertex shaders optimised after NoContraction%s\n", e ? " (EOWRECOMP_VK_OPT_VS)" : ": Mali");
     }
     return on;
 }
