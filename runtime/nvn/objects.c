@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>  // usleep (EOWRECOMP_FREEZE_TEST)
 
 #include "../kernel.h"
 #include "nvn.h"
