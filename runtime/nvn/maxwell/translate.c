@@ -24,6 +24,7 @@
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
 bool maxwell_gmem_bda;
+bool maxwell_native_half;  // shader.h
 // Iteration limit of a branching shader's dispatch loop (a mistranslated branch can't hang the GPU forever).
 // EOWRECOMP_SHADER_GUARD overrides it (backends read it): a small one shows which shaders loop.
 uint32_t maxwell_loop_guard = 100000;
@@ -1942,6 +1943,14 @@ static const char glsl_minmax_nmin[] =
     "vec2 mw_saturate(vec2 x) { return vec2(mw_saturate(x.x), mw_saturate(x.y)); }\n"
     "spirv_instruction(set = \"GLSL.std.450\", id = 79) float mw_fmin(float a, float b);\n"
     "spirv_instruction(set = \"GLSL.std.450\", id = 80) float mw_fmax(float a, float b);\n";
+static const char glsl_h2f_bits[] =
+    "float h2f(uint h) { uint s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;"
+    " if (e == 0u) { float d = float(m) * 5.9604644775390625e-8; return s != 0u ? -d : d; }"
+    " if (e == 31u) return uintBitsToFloat(s | 0x7F800000u | (m << 13));"
+    " return uintBitsToFloat(s | ((e + 112u) << 23) | (m << 13)); }\n";
+// maxwell_native_half (Mali: exec.c), fragment / compute only: the driver's own conversion. Those stages don't feed
+// the depth pre-pass's EQUAL test.
+static const char glsl_h2f_native[] = "float h2f(uint h) { return unpackHalf2x16(h).x; }\n";
 
 static const char glsl_prelude[] =
     "#version 460\n"
@@ -1979,10 +1988,7 @@ static const char glsl_prelude[] =
     // half -> float by bits, not unpackHalf2x16: NVIDIA's driver recognises unpacked halves and runs some of the
     // fp32 math after them in native fp16, differently per shader, so a depth pre-pass and its colour pass (EQUAL
     // test) placed wind-animated foliage apart: black slashes / flicker (tools: notes/PLAN.md 2026-10-08)
-    "float h2f(uint h) { uint s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;"
-    " if (e == 0u) { float d = float(m) * 5.9604644775390625e-8; return s != 0u ? -d : d; }"
-    " if (e == 31u) return uintBitsToFloat(s | 0x7F800000u | (m << 13));"
-    " return uintBitsToFloat(s | ((e + 112u) << 23) | (m << 13)); }\n"
+    "float h2f(uint h);\n"  // (glsl_h2f_bits / glsl_h2f_native, after the prelude)
     "vec2 unpack_h2(uint v) { return vec2(h2f(v & 0xFFFFu), h2f(v >> 16)); }\n"
     "vec2 hx(uint v, uint swz) { if (swz == 1u) return vec2(uintBitsToFloat(v)); vec2 h = unpack_h2(v); return swz == 2u ? h.xx : (swz == 3u ? h.yy : h); }\n"
     "uint hpack(vec2 r, uint merge, uint old) { if (merge == 1u) return floatBitsToUint(r.x); uint lo = packHalf2x16(vec2(r.x, 0.0f)), hi = packHalf2x16(vec2(r.y, 0.0f)); if (merge == 2u) return (old & 0xFFFF0000u) | lo; if (merge == 3u) return (old & 0xFFFFu) | (hi << 16); return lo | (hi << 16); }\n"
@@ -2028,6 +2034,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                                      : "",
        maxwell_nmin ? "#extension GL_EXT_spirv_intrinsics : require\n" : "");
     sp(&s, "%s%s", glsl_prelude + strlen("#version 460\n"), maxwell_nmin ? glsl_minmax_nmin : glsl_minmax_tests);
+    sp(&s, "%s", maxwell_native_half && stage != STAGE_VERTEX ? glsl_h2f_native : glsl_h2f_bits);
     if (stage != STAGE_VERTEX) sp(&s, "%s", glsl_warp32);
     for (int i = 0; i < 18; i++) {
         if (!(info->cbuf_mask & (1u << i))) continue;

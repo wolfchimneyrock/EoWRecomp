@@ -113,8 +113,24 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 // No spirv-opt by default: it rewrote the depth pre-pass and colour-pass vertex shaders differently enough that
 // their depths stopped matching (EQUAL test: black holes in foliage), and it was most of the compile time; the
 // driver optimises anyway. EOWRECOMP_VK_OPT=1 turns it back on (experiments).
+// Mali (ARM's driver; from LAS Recomp on a Mali-G610): fragment and compute shaders go through spirv-opt. The translated
+// pc-loop shaders (a switch on a guest pc inside a loop, guest registers as function-scope variables, the SSY / PBK
+// stacks as dynamically indexed arrays) compiled at -O0 are pathological for Mali's compiler: LAS's light-list pass took
+// ~400-800 ms of GPU a frame on a Mali-G610, 9 ms optimised. Vertex shaders stay -O0 (the depth pre-pass EQUAL reason
+// above). EOWRECOMP_VK_OPT_FS=0/1 forces it off / on for any GPU; optimised shaders have their own cache entries.
+static bool opt_stage(int stage) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("EOWRECOMP_VK_OPT_FS");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;  // (ARM)
+        if (on) LOG("[vk] fragment / compute shaders optimised (spirv-opt)%s\n", e ? " (EOWRECOMP_VK_OPT_FS)" : ": Mali");
+    }
+    return getenv("EOWRECOMP_VK_OPT") || (on && stage != STAGE_VERTEX);
+}
+
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
-    uint64_t h = src_hash(src, stage);
+    bool optimized = opt_stage(stage);
+    uint64_t h = src_hash(src, stage) ^ (optimized ? 0x9e3779b97f4a7c15ull : 0);
     static int nocache = -1;
     if (nocache < 0) nocache = getenv("EOWRECOMP_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
@@ -123,8 +139,8 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     if (!comp) comp = shaderc_compiler_initialize();
     shaderc_compile_options_t o = shaderc_compile_options_initialize();
     shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-    shaderc_compile_options_set_optimization_level(o, getenv("EOWRECOMP_VK_OPT") ? shaderc_optimization_level_performance
-                                                                                  : shaderc_optimization_level_zero);
+    shaderc_compile_options_set_optimization_level(o, optimized ? shaderc_optimization_level_performance
+                                                                 : shaderc_optimization_level_zero);
     shaderc_compilation_result_t r = shaderc_compile_into_spv(comp, src, strlen(src), kind_of(stage), name, "main", o);
     shaderc_compile_options_release(o);
     if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success) {

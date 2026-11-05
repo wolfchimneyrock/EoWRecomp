@@ -341,7 +341,35 @@ VkCommandBuffer vk_upload_cmd(void) {
     return s->upload;
 }
 
+// EOWRECOMP_VK_SPLIT_BARRIER=1 (default on Mali; from LAS Recomp on a Mali-G610): the same barrier in two halves, so the
+// work after it may start its vertex / tiling stages while the fragment work before it is still running (on a tiler an
+// ALL_COMMANDS -> ALL_COMMANDS barrier at every pass drains the GPU). Fragment-stage writes are made visible to the
+// fragment / compute / transfer stages after; everything else to all stages, as before. Assumes no vertex shader reads
+// what a previous pass's fragments wrote. LAS on a Mali-G610: GPU frame 14.8 -> 13.65 ms.
+static int split_barrier = -1;
 void vk_full_barrier(VkCommandBuffer cb) {
+    if (split_barrier < 0) {
+        const char *e = getenv("EOWRECOMP_VK_SPLIT_BARRIER");
+        split_barrier = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;
+        if (split_barrier) LOG("[vk] split pass barriers (fragment writes -> fragment / compute / transfer)%s\n",
+                               e ? " (EOWRECOMP_VK_SPLIT_BARRIER)" : ": Mali");
+    }
+    if (split_barrier) {
+        const VkPipelineStageFlags2 frag = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        const VkPipelineStageFlags2 rest = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+                                           VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                           VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+        VkMemoryBarrier2 mb2[2] = {
+            {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = frag, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+             .dstStageMask = frag | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+             .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT},
+            {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = rest, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+             .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT}};
+        VkDependencyInfo di2 = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 2, .pMemoryBarriers = mb2};
+        vkCmdPipelineBarrier2(cb, &di2);
+        return;
+    }
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
@@ -1338,11 +1366,24 @@ static void compile_program(void *arg) {
 }
 
 static void gmem_translate_params(void);
+// EOWRECOMP_VK_NATIVE_HALF=1 (default on Mali; from LAS Recomp): fragment and compute shaders convert halves with
+// unpackHalf2x16 instead of the bit-exact h2f (kept for vertex shaders: the depth pre-pass EQUAL reason in translate.c).
+// LAS on a Mali-G610: its light-list fragment shader calls h2f ~200 times; main pass 9.0 -> 4.5 ms.
+static void native_half_decide(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("EOWRECOMP_VK_NATIVE_HALF");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;
+        if (on) LOG("[vk] native half conversions in fragment / compute shaders%s\n", e ? " (EOWRECOMP_VK_NATIVE_HALF)" : ": Mali");
+    }
+    maxwell_native_half = on;
+}
 
 static void translate_program(void *arg) {
     Prog *p = arg;
     { static int g = -1; if (g < 0) { const char *e = getenv("EOWRECOMP_SHADER_GUARD"); g = e ? atoi(e) : 0; if (g > 0) maxwell_loop_guard = (uint32_t)g; } }
     gmem_translate_params();
+    native_half_decide();
     pthread_mutex_lock(&translate_lock);
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
@@ -2223,9 +2264,21 @@ static VkDescriptorBufferInfo gmem_info(void) {
             off = 1;
         }
     }
-    if (gmem_buf) {  // (a storage buffer can't be larger than the device allows: 128 MB on Adreno)
-        uint64_t range = gmem_size < g_vk.props.limits.maxStorageBufferRange ? gmem_size : g_vk.props.limits.maxStorageBufferRange;
-        return (VkDescriptorBufferInfo){gmem_buf, 0, range};
+    if (gmem_buf) {
+        // a storage buffer's range is limited (Mali-G610 / libmali: 2 GB, Adreno: 128 MB) and the heap may be larger:
+        // a descriptor over all of it is invalid (BOTW on the same engine faulted the GPU that way). The reach is
+        // clamped; reads past it return zero (robustBufferAccess) and are logged once.
+        uint64_t reach = g_vk.props.limits.maxStorageBufferRange & ~3ull;
+        if (gmem_size > reach) {
+            static uint64_t warned;
+            if (warned != gmem_size) {
+                warned = gmem_size;
+                LOG("[vk] guest heap %llu MB is larger than a storage buffer reaches (%llu MB): shader reads past it return zero\n",
+                    (unsigned long long)(gmem_size >> 20), (unsigned long long)(reach >> 20));
+            }
+            return (VkDescriptorBufferInfo){gmem_buf, 0, reach};
+        }
+        return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
     }
     static uint32_t zero[1024];
     VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
@@ -2755,6 +2808,7 @@ static CsProg *compute_program(NvnProgram *np) {
     CsProg *cp = calloc(1, sizeof *cp);
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
     gmem_translate_params();
+    native_half_decide();
     ShaderKey k = {0};
     k.glsl = 1;
     pthread_mutex_lock(&translate_lock);
