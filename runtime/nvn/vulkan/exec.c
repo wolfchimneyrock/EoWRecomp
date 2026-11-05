@@ -2091,7 +2091,6 @@ static void build_pipeline(void *arg) {
                                        .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
-    if (g_vk.exec_stats) pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     {  // test switch: EOWRECOMP_VK_PIPE_NOOPT=1 asks the driver for unoptimized (faster to build?) pipelines
         static int noopt = -1;
         if (noopt < 0) { const char *e = getenv("EOWRECOMP_VK_PIPE_NOOPT"); noopt = e && atoi(e); }
@@ -2099,7 +2098,17 @@ static void build_pipeline(void *arg) {
     }
     uint64_t t0 = SDL_GetTicksNS();
     job_begin("pipeline vs %llx fs %llx", (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
-    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+    extern _Thread_local char g_stats_label[128];
+    extern void vk_pipeline_stats(VkPipeline p);
+    if (g_vk.exec_stats) {  // (EOWRECOMP_VK_SHADER_STATS: the shaders by code address and the fs hash the GPU profile shows)
+        uint64_t fa = k->prog->code[1];
+        uint64_t fh = fa ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fa + 0x30), 0x200) : 0;
+        snprintf(g_stats_label, sizeof g_stats_label, "vs %llx fs %llx fsh %016llx", (unsigned long long)k->prog->code[0],
+                 (unsigned long long)fa, (unsigned long long)fh);
+        pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.exec_stats ? VK_NULL_HANDLE : g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+    if (g_vk.exec_stats && r == VK_SUCCESS) vk_pipeline_stats(pp->pipe);
     job_end();
     uint64_t dt = SDL_GetTicksNS() - t0;
     atomic_fetch_add(&stat_pipe_ns, dt);
@@ -2113,33 +2122,6 @@ static void build_pipeline(void *arg) {
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
-    } else if (g_vk.exec_stats) {  // the driver's view of each stage: one line per executable
-        VkPipelineExecutablePropertiesKHR ep[4];
-        uint32_t ne = 4;
-        for (int i = 0; i < 4; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
-        VkPipelineInfoKHR pinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = pp->pipe};
-        // (extension entry points through the device: a desktop Vulkan loader doesn't export them)
-        static PFN_vkGetPipelineExecutablePropertiesKHR get_props;
-        static PFN_vkGetPipelineExecutableStatisticsKHR get_stats;
-        if (!get_props) {
-            get_stats = (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineExecutableStatisticsKHR");
-            get_props = (PFN_vkGetPipelineExecutablePropertiesKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineExecutablePropertiesKHR");
-        }
-        if (!get_props || !get_stats || get_props(g_vk.dev, &pinfo, &ne, ep) < 0) ne = 0;
-        for (uint32_t e = 0; e < ne; e++) {
-            VkPipelineExecutableStatisticKHR s[32];
-            uint32_t ns = 32;
-            for (int i = 0; i < 32; i++) s[i] = (VkPipelineExecutableStatisticKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
-            VkPipelineExecutableInfoKHR xi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = pp->pipe, .executableIndex = e};
-            if (get_stats(g_vk.dev, &xi, &ns, s) < 0) ns = 0;  // (VK_INCOMPLETE: the first 32)
-            char line[1024];
-            int l = snprintf(line, sizeof line, "[vkstats] vs %llx fs %llx %s:", (unsigned long long)k->prog->code[0],
-                             (unsigned long long)k->prog->code[1], ep[e].name);
-            for (uint32_t i = 0; i < ns && l < (int)sizeof line - 40; i++)
-                l += snprintf(line + l, sizeof line - l, " %s=%llu", s[i].name, s[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR
-                              ? (unsigned long long)s[i].value.f64 : (unsigned long long)s[i].value.u64);
-            LOG("%s\n", line);
-        }
     }
     atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
     if (r == VK_SUCCESS && !pp->warm) warm_record_pipe(pp);
@@ -3972,7 +3954,14 @@ static void build_compute(void *arg) {
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
-    VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    extern _Thread_local char g_stats_label[128];
+    extern void vk_pipeline_stats(VkPipeline p);
+    if (g_vk.exec_stats) {
+        snprintf(g_stats_label, sizeof g_stats_label, "cs %llx", (unsigned long long)cp->p.code[0]);
+        ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
+    VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.exec_stats ? VK_NULL_HANDLE : g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    if (g_vk.exec_stats && r == VK_SUCCESS) vk_pipeline_stats(cp->pipe);
     atomic_fetch_add(&stat_compiles, 1), atomic_fetch_add(&vk_pipelines_made, 1);
     job_end();
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
@@ -3988,6 +3977,7 @@ static CsProg *compute_program(NvnProgram *np) {
     int n = g_cs_n;
     for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr) return tab[i].cp;
     CsProg *cp = calloc(1, sizeof *cp);
+    cp->p.code[0] = ss->code_addr;  // (EOWRECOMP_VK_SHADER_STATS' label)
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
     gmem_translate_params();
     native_half_decide();
