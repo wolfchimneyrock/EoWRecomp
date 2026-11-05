@@ -129,6 +129,8 @@ extern _Thread_local uint32_t maxwell_push_base, maxwell_push_cap;
 // The program's compiler constants (bound as c1) for the following maxwell_translate calls on this thread, for the c1
 // inlining. size 0 = unknown (c1 stays a uniform buffer).
 void maxwell_set_cb1(const uint8_t *data, uint32_t size);
+// (GLSL) Texture fetches moved down to their first use (EOWRECOMP_VK_SINK_TEX=1, off): from LAS Recomp's fork.
+extern bool maxwell_sink_tex;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;
