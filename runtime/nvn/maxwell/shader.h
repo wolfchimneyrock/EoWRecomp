@@ -86,6 +86,10 @@ typedef struct {
 // (GLSL compute, Vulkan) the fast copy of a dispatch's storage buffers: its address table and its data
 #define GMAP_BUFFER_INDEX 20
 #define GFAST_BUFFER_INDEX 21
+// (GLSL, maxwell_gmem_hi_word set) the guest heap's upper part, for GPUs whose storage buffers reach less than the heap:
+// gmem_ covers words [0, GMEM_LO_WORDS), gmemh_ words from maxwell_gmem_hi_word on (translate.c gmem_split)
+#define GMEMH_BUFFER_INDEX 22
+#define GMEM_LO_WORDS 0x20000000u  // 2 GB
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
@@ -99,6 +103,7 @@ extern bool maxwell_gmem_bda;
 #define GMEM_CHUNK_BYTES (1ull << GMEM_CHUNK_LOG2)
 #define GMEM_CHUNKS 8       // (HEAP_MAX, 3.25 GB, in 512 MB pieces: 7)
 extern bool maxwell_native_half;  // GLSL fragment / compute: halves through unpackHalf2x16 (translate.c)
+extern uint32_t maxwell_gmem_hi_word;  // 0: one heap buffer; else the word where gmemh_ (binding 22) starts
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;

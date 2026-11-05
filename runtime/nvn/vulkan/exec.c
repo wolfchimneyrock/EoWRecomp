@@ -1369,6 +1369,31 @@ static void gmem_translate_params(void);
 // EOWRECOMP_VK_NATIVE_HALF=1 (default on Mali; from LAS Recomp): fragment and compute shaders convert halves with
 // unpackHalf2x16 instead of the bit-exact h2f (kept for vertex shaders: the depth pre-pass EQUAL reason in translate.c).
 // LAS on a Mali-G610: its light-list fragment shader calls h2f ~200 times; main pass 9.0 -> 4.5 ms.
+// A guest heap larger than a storage buffer reaches (libmali on the Mali-G610: 2 GB): shaders reach it through two
+// windows, gmem_ = [0, 2 GB) and gmemh_ = [HEAP_MAX - reach, HEAP_MAX) (translate.c gmem_split; binding 22, gmemh_info).
+// Decided once the game has set its heap size, before its first shader. EOWRECOMP_VK_NO_GMEM_SPLIT=1: off (one
+// clamped buffer: reads past the reach return zero).
+static void gmem_split_decide(void) {
+    static bool done;
+    if (done) return;
+    uint64_t heap = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
+    if (!heap) return;  // (not set yet)
+    done = true;
+    if (heap > HEAP_MAX) heap = HEAP_MAX;
+    uint64_t reach = g_vk.props.limits.maxStorageBufferRange & ~3ull;
+    if (!g_vk.host_import || getenv("EOWRECOMP_VK_NO_GMEM") || heap <= reach || reach < HEAP_MAX - reach) return;
+    uint64_t al = g_vk.props.limits.minStorageBufferOffsetAlignment > 4 ? g_vk.props.limits.minStorageBufferOffsetAlignment : 4;
+    uint64_t hi = (HEAP_MAX - reach + al - 1) / al * al;
+    if (getenv("EOWRECOMP_VK_NO_GMEM_SPLIT")) {
+        LOG("[vk] guest heap %llu MB > storage range %llu MB: one clamped buffer (EOWRECOMP_VK_NO_GMEM_SPLIT)\n",
+            (unsigned long long)(heap >> 20), (unsigned long long)(reach >> 20));
+        return;
+    }
+    maxwell_gmem_hi_word = (uint32_t)(hi >> 2);
+    LOG("[vk] guest heap %llu MB > storage range %llu MB: shaders reach it through two windows (upper from %llu MB)\n",
+        (unsigned long long)(heap >> 20), (unsigned long long)(reach >> 20), (unsigned long long)(hi >> 20));
+}
+
 static void native_half_decide(void) {
     static int on = -1;
     if (on < 0) {
@@ -1384,6 +1409,7 @@ static void translate_program(void *arg) {
     { static int g = -1; if (g < 0) { const char *e = getenv("EOWRECOMP_SHADER_GUARD"); g = e ? atoi(e) : 0; if (g > 0) maxwell_loop_guard = (uint32_t)g; } }
     gmem_translate_params();
     native_half_decide();
+    gmem_split_decide();
     pthread_mutex_lock(&translate_lock);
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
@@ -2271,7 +2297,7 @@ static VkDescriptorBufferInfo gmem_info(void) {
         uint64_t reach = g_vk.props.limits.maxStorageBufferRange & ~3ull;
         if (gmem_size > reach) {
             static uint64_t warned;
-            if (warned != gmem_size) {
+            if (warned != gmem_size && !maxwell_gmem_hi_word) {
                 warned = gmem_size;
                 LOG("[vk] guest heap %llu MB is larger than a storage buffer reaches (%llu MB): shader reads past it return zero\n",
                     (unsigned long long)(gmem_size >> 20), (unsigned long long)(reach >> 20));
@@ -2292,6 +2318,15 @@ static VkDescriptorBufferInfo gmem_base_info(void) {
     for (int i = 0; i < GMEM_CHUNKS; i++) v[i][0] = (uint32_t)gmem_addrs[i], v[i][1] = (uint32_t)(gmem_addrs[i] >> 32);
     VkSpan s = vk_transient_copy(v, sizeof v, 256);
     return (VkDescriptorBufferInfo){s.buf, s.off, sizeof v};
+}
+
+// The heap's upper window (gmem_split_decide): from maxwell_gmem_hi_word on, as far as the import and the reach go
+static VkDescriptorBufferInfo gmemh_info(void) {
+    VkDescriptorBufferInfo lo = gmem_info();
+    uint64_t off = (uint64_t)maxwell_gmem_hi_word << 2, reach = g_vk.props.limits.maxStorageBufferRange & ~3ull;
+    if (!gmem_buf || !off || gmem_size <= off) return lo;  // (heap not that large (yet): reads there are past the end anyway)
+    uint64_t range = gmem_size - off < reach ? gmem_size - off : reach;
+    return (VkDescriptorBufferInfo){gmem_buf, off, range};
 }
 
 // Compute dispatches that use global memory: the imported heap is host memory across PCIe on a discrete GPU, and a
@@ -2743,7 +2778,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-            bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info() : gmem_info();
+            bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info() : b->binding == GMEMH_BUFFER_INDEX ? gmemh_info() : gmem_info();
             w[n].pBufferInfo = &bi[n];
         } else {
             continue;  // rscale / tint: written below, once the textures (and their scales) are known
@@ -2809,6 +2844,7 @@ static CsProg *compute_program(NvnProgram *np) {
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
     gmem_translate_params();
     native_half_decide();
+    gmem_split_decide();
     ShaderKey k = {0};
     k.glsl = 1;
     pthread_mutex_lock(&translate_lock);
