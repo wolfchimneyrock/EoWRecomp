@@ -79,6 +79,11 @@ typedef struct {
     uint32_t local_mem;     // bytes of local memory
     uint32_t num_insts;
     char error[256];        // set when translation fails
+    // (GLSL vertex / fragment, maxwell_glsl_push) constant buffer words moved into push constants (pcw[k]: the word at
+    // byte push_off[k] of cbuf push_cb[k]): the most read, loops first. (After error[]: the fields before it are the
+    // reference translator's in tools/test_translate.)
+    uint8_t npush, push_cb[64];
+    uint16_t push_off[64], push_base;  // (push_base: the block's offset in the push range, bytes)
 } ShaderInfo;
 
 // Global memory (LDG/STG) is addressed through one buffer that wraps the guest heap.
@@ -114,6 +119,16 @@ extern bool maxwell_gmem_mirror;
 // do-while (goto elimination) instead of the pc state machine or the FWD blocks. The backend's default for this GPU
 // (exec.c: Mali, Adreno); EOWRECOMP_VK_STATIC_STACKS / EOWRECOMP_VK_STRUCTURE =1 / =0 override.
 extern bool maxwell_glsl_structured;
+// (GLSL) c1 inlined (statically indexed compiler constants as literals: maxwell_set_cb1's data) and the hottest
+// constant buffer words as push constants (ShaderInfo.npush). The backend's default (exec.c: Mali, Adreno);
+// EOWRECOMP_VK_INLINE_C1 / EOWRECOMP_VK_PUSH_CB =1 / =0 override. The fragment shader's push words start at
+// maxwell_push_base (bytes: after the vertex shader's), at most maxwell_push_cap words in all: set by the caller around
+// maxwell_translate, on its own thread.
+extern bool maxwell_glsl_push;
+extern _Thread_local uint32_t maxwell_push_base, maxwell_push_cap;
+// The program's compiler constants (bound as c1) for the following maxwell_translate calls on this thread, for the c1
+// inlining. size 0 = unknown (c1 stays a uniform buffer).
+void maxwell_set_cb1(const uint8_t *data, uint32_t size);
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;
