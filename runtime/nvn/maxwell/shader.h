@@ -68,7 +68,7 @@ typedef struct {
     uint32_t out_mask;      // vertex: output varyings; fragment: render targets written
     bool writes_depth, uses_discard, writes_point_size;
     bool uses_gmem;         // global memory access: bind the guest heap at GMEM_BUFFER_INDEX
-    bool uses_gmem_map;     // (GLSL compute only) gmem loads look their address up in GMap (uniform, binding
+    bool uses_gmem_map;     // (GLSL compute; every stage with maxwell_gmem_mirror) gmem loads look their address up in GMap (uniform, binding
                             // GMAP_BUFFER_INDEX) and read GFast (storage, GFAST_BUFFER_INDEX) - a device-local copy of the
                             // dispatch's storage buffers - when found, stores too (copied back after the dispatch).
                             // runtime/nvn/vulkan/exec.c
@@ -104,6 +104,12 @@ extern bool maxwell_gmem_bda;
 #define GMEM_CHUNKS 8       // (HEAP_MAX, 3.25 GB, in 512 MB pieces: 7)
 extern bool maxwell_native_half;  // GLSL fragment / compute: halves through unpackHalf2x16 (translate.c)
 extern uint32_t maxwell_gmem_hi_word;  // 0: one heap buffer; else the word where gmemh_ (binding 22) starts
+// (GLSL / Vulkan) No heap import (Turnip, PanVK: no VK_EXT_external_memory_host; LAS Recomp issue #483): every stage
+// reaches its storage buffers through the address table (GMap / GFast, as compute does), which points into copies of
+// the guest memory they cover (vulkan/exec.c gmir_). There is no heap buffer (gmem_) then: accesses outside the table
+// read 0 and drop their stores. Set once before the first translation, never changed after (read by every thread).
+// Not with maxwell_gmem_bda (that heap is reachable).
+extern bool maxwell_gmem_mirror;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;

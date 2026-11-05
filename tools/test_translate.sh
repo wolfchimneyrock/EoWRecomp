@@ -3,6 +3,7 @@
 #   MSL output byte-identical to the reference MSL-only translator (REF, default: the commit before the GLSL
 #   backend), and every GLSL translation compiles (shaderc, Vulkan 1.3) and validates (SPIRV-Tools).
 # usage: tools/test_translate.sh [count] [jobs] [mode msl|glsl|both]
+# TT_GMEM_MIRROR=1: GLSL with guest memory through copies (no host import: shader.h maxwell_gmem_mirror)
 # Needs clang + shaderc + SPIRV-Tools (Windows: MSYS2 ucrt64; macOS: brew install shaderc spirv-tools, or
 # GLSL=0 for the MSL comparison only).
 set -e
@@ -20,7 +21,7 @@ RENAME="-Dmaxwell_translate=old_maxwell_translate -Dmaxwell_free=old_maxwell_fre
  -Dmaxwell_disassemble=old_maxwell_disassemble -Dmaxwell_gmem_base=old_maxwell_gmem_base
  -Dmaxwell_gmem_size=old_maxwell_gmem_size -Dmaxwell_dbg_code=old_maxwell_dbg_code -Dmaxwell_dbg_pc=old_maxwell_dbg_pc
  -Dmaxwell_dbg_reg=old_maxwell_dbg_reg -Dmaxwell_dbg_vs=old_maxwell_dbg_vs -Dmaxwell_loop_guard=old_maxwell_loop_guard
- -Dmaxwell_gmem_bda=old_maxwell_gmem_bda"
+ -Dmaxwell_gmem_bda=old_maxwell_gmem_bda -Dmaxwell_gmem_mirror=old_maxwell_gmem_mirror"
 PRE=""
 case "$(uname -s)" in MINGW*|MSYS*) PRE="-include malloc.h";; esac
 $CC -O2 -w $PRE $RENAME -c "$OUT/old/translate.c" -o "$OUT/old.o"

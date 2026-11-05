@@ -224,6 +224,8 @@ int main(int argc, char **argv) {
     bool do_msl = strcmp(mode, "glsl") != 0, do_glsl = strcmp(mode, "msl") != 0;
     maxwell_gmem_base = old_maxwell_gmem_base = 0x80000000ull;
     maxwell_gmem_size = old_maxwell_gmem_size = 0x10000000ull;
+    // TT_GMEM_MIRROR=1: every stage through the address table, no heap behind it (no host import: exec.c gmir_)
+    maxwell_gmem_mirror = getenv("TT_GMEM_MIRROR") && atoi(getenv("TT_GMEM_MIRROR")) != 0;
 #ifdef WITH_GLSL
     shaderc_compiler_t comp = shaderc_compiler_initialize();
     shaderc_compile_options_t opt = shaderc_compile_options_initialize();

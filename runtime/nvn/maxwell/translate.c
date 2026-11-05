@@ -27,6 +27,7 @@ uint64_t maxwell_gmem_base, maxwell_gmem_size;
 bool maxwell_gmem_bda;
 bool maxwell_native_half;  // shader.h
 uint32_t maxwell_gmem_hi_word;  // shader.h
+bool maxwell_gmem_mirror;       // shader.h
 // Iteration limit of a branching shader's dispatch loop (a mistranslated branch can't hang the GPU forever).
 // EOWRECOMP_SHADER_GUARD overrides it (backends read it): a small one shows which shaders loop.
 uint32_t maxwell_loop_guard = 100000;
@@ -896,21 +897,23 @@ static void gmem_atomic(Ctx *c, uint64_t w, int a, int vr, int dst, int size, in
        (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size, R(vr));
     if (c->glsl && cas) {
         const char *word = "gmw(uint(ga >> 2))";
-        if (c->stage == STAGE_COMPUTE) {
+        if (c->stage == STAGE_COMPUTE || maxwell_gmem_mirror) {
             c->info->uses_gmem_map = true;
             sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
             sp(&c->body, "      if (fw != 0xFFFFFFFFu) { o_ = gfast_.w[fw]; for (;;) { uint p_ = atomicCompSwap(gfast_.w[fw], o_, %s); "
-               "if (p_ == o_) break; o_ = p_; } }\n      else ", gl_cas[op]);
+               "if (p_ == o_) break; o_ = p_; } }\n%s", gl_cas[op], maxwell_gmem_mirror ? "" : "      else ");
         } else {
             sp(&c->body, "      ");
         }
-        sp(&c->body, "if (ok) { o_ = %s; for (;;) { uint p_ = atomicCompSwap(%s, o_, %s); if (p_ == o_) break; o_ = p_; } }\n",
-           word, word, gl_cas[op]);
-    } else if (c->glsl && c->stage == STAGE_COMPUTE) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
+        if (!maxwell_gmem_mirror)  // (copies: no heap outside the table - see LDG / STG)
+            sp(&c->body, "if (ok) { o_ = %s; for (;;) { uint p_ = atomicCompSwap(%s, o_, %s); if (p_ == o_) break; o_ = p_; } }\n",
+               word, word, gl_cas[op]);
+    } else if (c->glsl && (c->stage == STAGE_COMPUTE || maxwell_gmem_mirror)) {  // (the dispatch's storage buffers have a device-local copy: see LDG / STG)
         c->info->uses_gmem_map = true;
         sp(&c->body, "      uint fw = ok ? gfind(uint(ga)) : 0xFFFFFFFFu;\n");
-        sp(&c->body, "      if (fw != 0xFFFFFFFFu) o_ = %s(gfast_.w[fw], v_); else if (ok) o_ = %s(gmw(uint(ga >> 2)), v_);\n",
-           gl_op[op], gl_op[op]);
+        if (maxwell_gmem_mirror) sp(&c->body, "      if (fw != 0xFFFFFFFFu) o_ = %s(gfast_.w[fw], v_);\n", gl_op[op]);
+        else sp(&c->body, "      if (fw != 0xFFFFFFFFu) o_ = %s(gfast_.w[fw], v_); else if (ok) o_ = %s(gmw(uint(ga >> 2)), v_);\n",
+                gl_op[op], gl_op[op]);
     } else if (c->glsl) {
         sp(&c->body, "      if (ok) o_ = %s(gmw(uint(ga >> 2)), v_);\n", gl_op[op]);
     } else if (cas) {  // MSL: signed min/max on the word as an atomic_int
@@ -1534,13 +1537,15 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         static const char *const ld_small[] = {"uint(gmem[ga])", "uint(int(char(gmem[ga])))",
                                                "uint(*(device ushort *)(gmem + ga))", "uint(int(*(device short *)(gmem + ga)))"};
         int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
-        if (c->glsl && c->stage == STAGE_COMPUTE) {
+        if (c->glsl && (c->stage == STAGE_COMPUTE || maxwell_gmem_mirror)) {
             // Compute (Vulkan): the guest heap is host memory across PCIe on a discrete GPU, and a shader storing to
             // it in a loop crawls (the little chain chomps in Madam MeowMeow's house: ~4 ms a dispatch, ~0.07 ms without
             // the heap stores). The dispatch's storage buffers are copied to a device-local buffer (gfast_, address
             // table gmap: exec.c gfast_prepare) and back after it: loads and stores inside them use that copy.
-            // Anything outside the table goes to the heap as before.
+            // Anything outside the table goes to the heap as before - except with copies (maxwell_gmem_mirror: every
+            // stage comes here), where there is no heap to fall back to: reads are 0, stores are dropped.
             c->info->uses_gmem_map = true;
+            bool mir = maxwell_gmem_mirror;
             static const char *const gl_small[] = {
                 "(%s >> (uint(ga & 3ul) * 8u)) & 0xFFu", "uint(sx8(%s >> (uint(ga & 3ul) * 8u)))",
                 "(%s >> (uint(ga & 2ul) * 8u)) & 0xFFFFu", "uint(sx16(%s >> (uint(ga & 2ul) * 8u)))"};
@@ -1552,14 +1557,16 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                         snprintf(fast, sizeof fast, gl_small[size], "gfast_.w[fw]");
                         snprintf(slow, sizeof slow, gl_small[size], "gmw(uint(ga >> 2))");
                         c->reg_used[d] = 1;
-                        sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? %s : ok ? %s : 0u;\n", d, fast, slow);
+                        if (mir) sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? %s : 0u;\n", d, fast);
+                        else sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? %s : ok ? %s : 0u;\n", d, fast, slow);
                     }
                 } else {
                     for (int k = 0; k < nw; k++)
                         if (d != RZ && d + k < RZ) {
                             c->reg_used[d + k] = 1;
-                            sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? gfast_.w[fw + %du] : ok ? gmw(uint(ga >> 2) + %du) : 0u;\n",
-                               d + k, k, k);
+                            if (mir) sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? gfast_.w[fw + %du] : 0u;\n", d + k, k);
+                            else sp(&c->body, "      r%d = fw != 0xFFFFFFFFu ? gfast_.w[fw + %du] : ok ? gmw(uint(ga >> 2) + %du) : 0u;\n",
+                                    d + k, k, k);
                         }
                 }
             } else {
@@ -1570,11 +1577,13 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     const char *bm = size < 2 ? "3ul" : "2ul";
                     sp(&c->body, "      if (ok) { uint sh = uint(ga & %s) * 8u; uint v = (%s & 0x%xu) << sh;\n", bm, R(d), m);
                     sp(&c->body, "        if (fw != 0xFFFFFFFFu) { atomicAnd(gfast_.w[fw], ~(0x%xu << sh)); atomicOr(gfast_.w[fw], v); }\n", m);
-                    sp(&c->body, "        else { atomicAnd(gmw(uint(ga >> 2)), ~(0x%xu << sh)); atomicOr(gmw(uint(ga >> 2)), v); } }\n", m);
+                    if (mir) sp(&c->body, "      }\n");
+                    else sp(&c->body, "        else { atomicAnd(gmw(uint(ga >> 2)), ~(0x%xu << sh)); atomicOr(gmw(uint(ga >> 2)), v); } }\n", m);
                 } else {
                     for (int k = 0; k < nw; k++)
-                        sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s; else if (ok) gmw(uint(ga >> 2) + %du) = %s;\n", k,
-                           R(d == RZ ? RZ : d + k), k, R(d == RZ ? RZ : d + k));
+                        if (mir) sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s;\n", k, R(d == RZ ? RZ : d + k));
+                        else sp(&c->body, "      if (fw != 0xFFFFFFFFu) gfast_.w[fw + %du] = %s; else if (ok) gmw(uint(ga >> 2) + %du) = %s;\n", k,
+                                R(d == RZ ? RZ : d + k), k, R(d == RZ ? RZ : d + k));
                 }
             }
         } else if (c->glsl) {  // gmw(word): 32-bit words; sub-word accesses within the containing word
@@ -2117,7 +2126,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     int stage = c->stage;
     Str body = {0};
     glsl_rewrite(c, &body, c->body.buf ? c->body.buf : "");
-    uint32_t hi_word = info->uses_gmem && !maxwell_gmem_bda ? maxwell_gmem_hi_word : 0;
+    uint32_t hi_word = info->uses_gmem && !maxwell_gmem_bda && !maxwell_gmem_mirror ? maxwell_gmem_hi_word : 0;
     if (hi_word && body.buf) { char *b2 = gmem_split(body.buf, hi_word); free(body.buf); body.buf = b2; }
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
     if (info->cbuf_mask >> 18) fail(c, "cbuf index out of range");
@@ -2148,7 +2157,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
            c->uses_gmem_store ? "" : "readonly ");
         sp(&s, "#define gmw(i) GMemRef(gmem_base[(i) >> %du].xy).w[(i) & 0x%xu]\n", GMEM_CHUNK_LOG2 - 2,
            (unsigned)((GMEM_CHUNK_BYTES >> 2) - 1));
-    } else if (info->uses_gmem) {
+    } else if (info->uses_gmem && !maxwell_gmem_mirror) {  // (copies: no heap buffer, everything goes through the table)
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
         sp(&s, "#define gmw(i) gmem_.w[i]\n");
@@ -2160,7 +2169,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (c->uses_gmem_store)
             sp(&s, "void gmw_(uint i, uint v) { if (i < 0x%xu) gmem_.w[i] = v; else gmemh_.w[i - 0x%xu] = v; }\n", GMEM_LO_WORDS, hi_word);
     }
-    if (info->uses_gmem_map) {  // (compute) the dispatch's storage buffers, device-local: gmap[i] = heap offset, size, word
+    if (info->uses_gmem_map) {  // (compute; every stage with copies) the dispatch's storage buffers, device-local: gmap[i] = heap offset, size, word
         sp(&s, "layout(std140, set = %d, binding = %d) uniform GMap { uvec4 gmap[%d]; };\n", set, GMAP_BUFFER_INDEX, GMAP_MAX + 1);
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GFast { uint w[]; } gfast_;\n", set, GFAST_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
