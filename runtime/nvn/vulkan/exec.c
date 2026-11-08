@@ -2043,6 +2043,17 @@ static void build_pipeline(void *arg) {
         // fails those pipelines at once (their draws are skipped) so the rest can render.
         static size_t lim = (size_t)-1;
         if (lim == (size_t)-1) { const char *e = getenv("EOWRECOMP_MAX_FS_GLSL"); lim = e && atoi(e) > 0 ? (size_t)atoi(e) : 0; }
+        // EOWRECOMP_MAX_VS_GLSL=<bytes>: the same for the vertex shader (Windows log 2026-11-08: the pipeline that ran for
+        // minutes pairs a 75 KB fragment shader with a 108 KB vertex shader, code 72a5c0e100)
+        static size_t vlim = (size_t)-1;
+        if (vlim == (size_t)-1) { const char *e = getenv("EOWRECOMP_MAX_VS_GLSL"); vlim = e && atoi(e) > 0 ? (size_t)atoi(e) : 0; }
+        size_t vl = k->prog->vi && k->prog->vi->msl ? strlen(k->prog->vi->msl) : 0;
+        if (vlim && vl > vlim) {
+            LOG("[vk] pipeline skipped: vs code %llx has %zu bytes of GLSL (EOWRECOMP_MAX_VS_GLSL=%zu)\n",
+                (unsigned long long)k->prog->code[0], vl, vlim);
+            atomic_store(&pp->state, 2);
+            return;
+        }
         size_t fl = k->prog->fi && k->prog->fi->msl ? strlen(k->prog->fi->msl) : 0;
         if (lim && fl > lim) {
             LOG("[vk] pipeline skipped: fs code %llx has %zu bytes of GLSL (EOWRECOMP_MAX_FS_GLSL=%zu)\n",
