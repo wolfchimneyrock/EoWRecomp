@@ -96,9 +96,10 @@ static bool make_layout(Layout *l, const uint32_t *const *spv, const size_t *nw,
     for (int i = 0; i < nmod; i++) l->n += vk_reflect(spv[i], nw[i], l->b + l->n, 96 - l->n);
     for (int i = 0; i < l->n; i++) {  // the binding numbers the renderer fills (exec.c stage_set)
         VkBindingInfo *b = &l->b[i];
-        bool ok = b->binding >= 32 ? b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-                : b->binding == 17 ? b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-                : b->binding <= 19 ? b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : false;
+        bool ok = b->binding >= 32 ? b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                : b->binding == GMEM_BUFFER_INDEX || b->binding == GFAST_BUFFER_INDEX || b->binding == GMEMH_BUFFER_INDEX
+                    ? b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                : b->binding <= 19 || b->binding == GMAP_BUFFER_INDEX ? b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : false;
         if (!ok || (int)b->set >= nsets) { fprintf(stderr, "unexpected binding set %u binding %u type %d\n", b->set, b->binding, b->type); return false; }
     }
     VkShaderStageFlags st[2] = {nsets == 1 ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT};
