@@ -813,7 +813,7 @@ static void *worker(void *a) {
 typedef struct { _Atomic uint64_t t0; uint64_t reported; char what[112]; } JobSlot;
 static JobSlot job_slots[24];
 static _Atomic int job_nslots;
-static _Atomic uint64_t job_done;  // builds finished (the watchdog saves the pipeline cache when it grew)
+static _Atomic uint64_t job_done;  // builds finished
 static __thread int job_slot = -1;
 static void job_begin(const char *fmt, ...) {
     if (job_slot < 0) job_slot = atomic_fetch_add(&job_nslots, 1) % 24;
@@ -832,17 +832,12 @@ static void job_end(void) {
     atomic_fetch_add(&job_done, 1);
     if (dt > 2000000000ull) LOG("[job] %s took %.1f s\n", js->what, dt / 1e9);
 }
-void vk_pipeline_cache_save(void);  // device.c
 static void *job_watchdog(void *a) {
     (void)a;
     plat_thread_default_core();  // (all cores: started from a game thread held to the big ones)
-    uint64_t saved = 0;
-    for (int tick = 1;; tick++) {
+    for (;;) {
         SDL_Delay(5000);
-        // the pipeline cache every 60 s while new pipelines are built: a process that is killed (a launcher's quit
-        // hotkey) never reaches the save at exit, and Mali's compiler takes seconds per pipeline of this game
-        uint64_t done = atomic_load(&job_done);
-        if (tick % 12 == 0 && done != saved) { saved = done; vk_pipeline_cache_save(); }
+        // (the pipeline cache is saved every 30 s while it grows by backend_present, device.c)
         uint64_t now = plat_now_ns();
         for (int i = 0; i < 24; i++) {
             uint64_t t0 = atomic_load(&job_slots[i].t0);
