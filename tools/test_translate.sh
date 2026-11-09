@@ -37,7 +37,15 @@ PRE=""
 case "$(uname -s)" in MINGW*|MSYS*) PRE="-include malloc.h";; esac
 $CC -O2 -w $PRE $RENAME -c "$OUT/old/translate.c" -o "$OUT/old.o"
 $CC -O2 -Wall -Wno-format-truncation -Wno-format-overflow -c runtime/nvn/maxwell/translate.c -o "$OUT/new.o"
-$CC -O2 -Wall tools/test_translate.c "$OUT/new.o" "$OUT/old.o" -o "$OUT/test_translate" -lm
+# a REF without the copies path or c1 inlining (d36ff74): stand-ins, so the harness links (the reference then
+# translates as it always did: no mirror, c1 read from the buffer)
+: > "$OUT/old_stub.c"
+nm "$OUT/old.o" | grep -q ' [BDC] old_maxwell_gmem_mirror$' || echo '#include <stdbool.h>
+bool old_maxwell_gmem_mirror;' >> "$OUT/old_stub.c"
+nm "$OUT/old.o" | grep -q ' T old_maxwell_set_cb1$' || echo '#include <stdint.h>
+void old_maxwell_set_cb1(const uint8_t *d, uint32_t n) { (void)d; (void)n; }' >> "$OUT/old_stub.c"
+$CC -O2 -c "$OUT/old_stub.c" -o "$OUT/old_stub.o"
+$CC -O2 -Wall tools/test_translate.c "$OUT/new.o" "$OUT/old.o" "$OUT/old_stub.o" -o "$OUT/test_translate" -lm
 PER=$(( (COUNT + JOBS - 1) / JOBS ))
 i=0
 PIDS=
