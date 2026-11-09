@@ -267,7 +267,8 @@ static void ex_set_data_source(Cpu *c) {
     e->pkt = av_packet_alloc();
     e->ntracks = 0;
     // the opening at launch can always be skipped, vanilla and randomizer (with no save yet the game forces it)
-    e->skippable = rel && strstr(rel, "movie/opening.webm");
+    // (LAS Recomp's movie/opening.webm; this game's is region_common/movie/rd004_Opening.webm)
+    e->skippable = rel && (strstr(rel, "movie/opening.webm") || strstr(rel, "_Opening.webm"));
     if (e->skippable) g_skip_pressed_at = 0;  // (a press that ended the title's attract replay isn't for this one)
     for (unsigned i = 0; i < e->fmt->nb_streams && e->ntracks < 16; i++)
         if (e->fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ||
