@@ -1848,13 +1848,20 @@ static void build_pipeline(void *arg) {
         uint32_t ne = 4;
         for (int i = 0; i < 4; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
         VkPipelineInfoKHR pinfo = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = pp->pipe};
-        vkGetPipelineExecutablePropertiesKHR(g_vk.dev, &pinfo, &ne, ep);
+        // (extension entry points through the device: a desktop Vulkan loader doesn't export them)
+        static PFN_vkGetPipelineExecutablePropertiesKHR get_props;
+        static PFN_vkGetPipelineExecutableStatisticsKHR get_stats;
+        if (!get_props) {
+            get_stats = (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineExecutableStatisticsKHR");
+            get_props = (PFN_vkGetPipelineExecutablePropertiesKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineExecutablePropertiesKHR");
+        }
+        if (!get_props || !get_stats || get_props(g_vk.dev, &pinfo, &ne, ep) < 0) ne = 0;
         for (uint32_t e = 0; e < ne; e++) {
             VkPipelineExecutableStatisticKHR s[32];
             uint32_t ns = 32;
             for (int i = 0; i < 32; i++) s[i] = (VkPipelineExecutableStatisticKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
             VkPipelineExecutableInfoKHR xi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = pp->pipe, .executableIndex = e};
-            vkGetPipelineExecutableStatisticsKHR(g_vk.dev, &xi, &ns, s);
+            if (get_stats(g_vk.dev, &xi, &ns, s) < 0) ns = 0;  // (VK_INCOMPLETE: the first 32)
             char line[1024];
             int l = snprintf(line, sizeof line, "[vkstats] vs %llx fs %llx %s:", (unsigned long long)k->prog->code[0],
                              (unsigned long long)k->prog->code[1], ep[e].name);
